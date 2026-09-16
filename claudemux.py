@@ -216,8 +216,9 @@ class Session:
 
 def parse_session_line(line: str, uid: int, socket: Optional[str]) -> Optional[Session]:
     parts = line.split(SEP)
-    if len(parts) != 8:
-        return None
+    if len(parts) < 8:
+        return None  # a tmux too old for one of these format variables
+    parts = parts[:8]
 
     def as_int(value: str) -> int:
         try:
@@ -368,9 +369,11 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
             "Started session: %s  (in %s)%s"
             % (session_name, cwd, ", Remote Control on" if want_rc else "")
         )
-        existing = find_session(session_name)
-        if existing is None:
-            die("session %s vanished immediately after starting" % session_name)
+        existing = find_session(session_name) or Session(
+            name=session_name, uid=os.getuid(), socket=None, windows=1,
+            attached=0, created=int(time.time()), activity=int(time.time()),
+            path=cwd, command="", pane_pid=0,
+        )
     else:
         print("Reattaching to existing session: %s" % session_name)
 

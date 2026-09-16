@@ -21,6 +21,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux
       - name: unit tests
         run: python -m unittest discover -s tests -v
+      - name: tmux version
+        run: tmux -V
+
       - name: end-to-end (create, list, kill a real session)
         run: |
           printf '#!/bin/sh\nsleep 60\n' > /tmp/fake-claude && chmod +x /tmp/fake-claude
@@ -29,6 +32,16 @@ jobs:
           python claudemux.py -l | grep -q "claude-$(id -un)-ci"
           python claudemux.py -l --json | python -c 'import json,sys; assert json.load(sys.stdin)[0]["name"].endswith("-ci")'
           python claudemux.py -k ci
+
+      - name: diagnostics
+        if: always()
+        run: |
+          export CLAUDE_BIN=/tmp/fake-claude
+          python claudemux.py --detach -n diag || true
+          echo "--- tmux list-sessions ---"; tmux ls || true
+          echo "--- raw format output ---"
+          tmux list-sessions -F '#{session_name}|#{session_windows}|#{session_attached}|#{session_created}|#{session_activity}|#{pane_current_path}|#{pane_current_command}|#{pane_pid}' || true
+          echo "--- claudemux -l ---"; python claudemux.py -l || true
 
   shellcheck:
     runs-on: ubuntu-latest
