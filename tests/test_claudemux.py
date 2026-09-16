@@ -103,7 +103,11 @@ class TestPaneCommand(unittest.TestCase):
 
 class TestSessionParsing(unittest.TestCase):
     def line(self, *fields):
-        return claudemux.SEP.join(str(f) for f in fields)
+        """Build a line the way tmux -F would, escaping spaces as #{q:} does."""
+        return " ".join(
+            claudemux.MARK + str(f).replace("\\", "\\\\").replace(" ", "\\ ")
+            for f in fields
+        )
 
     def test_parses_a_full_line(self):
         now = int(time.time())
@@ -124,6 +128,20 @@ class TestSessionParsing(unittest.TestCase):
             self.line("s", 1, 0, 1, 1, "/tmp", "bash", 1), uid=0, socket=None
         )
         self.assertEqual(session.state, "detached")
+
+    def test_handles_a_path_containing_spaces(self):
+        session = claudemux.parse_session_line(
+            self.line("s", 1, 0, 1, 1, "/root/dir with space", "bash", 7),
+            uid=0, socket=None,
+        )
+        self.assertEqual(session.path, "/root/dir with space")
+
+    def test_an_empty_field_does_not_shift_the_others(self):
+        session = claudemux.parse_session_line(
+            self.line("s", 1, 0, 1, 1, "", "", 7), uid=0, socket=None
+        )
+        self.assertEqual(session.path, "")
+        self.assertEqual(session.pane_pid, 7)
 
     def test_rejects_a_short_line(self):
         self.assertIsNone(claudemux.parse_session_line("claude-root-api", 0, None))

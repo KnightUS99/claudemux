@@ -30,7 +30,7 @@ from typing import List, Optional, Sequence, Tuple
 __version__ = "1.0.0"
 
 PREFIX = "claude"
-SEP = "\x1f"  # unit separator: safe inside tmux -F output, never in a name
+MARK = "v"  # see field(): keeps an empty value from vanishing when we split
 HISTORY_LIMIT = 50000
 QUICK_EXIT_SECONDS = 5  # below this, hold the pane open even on a clean exit
 
@@ -166,16 +166,35 @@ def discover_servers(all_users: bool) -> List[Tuple[int, Optional[str]]]:
     return servers
 
 
-LIST_FORMAT = SEP.join(
-    (
-        "#{session_name}",
-        "#{session_windows}",
-        "#{session_attached}",
-        "#{session_created}",
-        "#{session_activity}",
-        "#{pane_current_path}",
-        "#{pane_current_command}",
-        "#{pane_pid}",
+def field(name: str) -> str:
+    """One field of a -F format string, safe to split back apart.
+
+    tmux from 3.3 onwards strips control characters out of format output, so a
+    separator like \\x1f silently collapses every field into one. #{q:...} has
+    tmux escape anything shell-special instead (spaces in paths, quotes), which
+    shlex then undoes. The leading marker keeps an empty value from
+    disappearing entirely and taking the field count with it.
+    """
+    return "%s#{q:%s}" % (MARK, name)
+
+
+def split_fields(line: str) -> List[str]:
+    try:
+        return [token[len(MARK):] for token in shlex.split(line)]
+    except ValueError:
+        return []
+
+
+LIST_FORMAT = " ".join(
+    field(name) for name in (
+        "session_name",
+        "session_windows",
+        "session_attached",
+        "session_created",
+        "session_activity",
+        "pane_current_path",
+        "pane_current_command",
+        "pane_pid",
     )
 )
 
@@ -215,9 +234,9 @@ class Session:
 
 
 def parse_session_line(line: str, uid: int, socket: Optional[str]) -> Optional[Session]:
-    parts = line.split(SEP)
+    parts = split_fields(line)
     if len(parts) < 8:
-        return None  # a tmux too old for one of these format variables
+        return None
     parts = parts[:8]
 
     def as_int(value: str) -> int:
@@ -420,25 +439,30 @@ def session_details(session: Session) -> List[Tuple[str, str]]:
 
     code, out = tmux_run(
         session.socket, "list-clients", "-t", "=" + session.name,
-        "-F", SEP.join(("#{client_tty}", "#{client_activity}")),
+        "-F", " ".join(field(f) for f in ("client_tty", "client_activity")),
     )
     if code == 0 and out:
         for line in out.splitlines():
-            tty, _, activity = line.partition(SEP)
+            parts = split_fields(line)
+            if len(parts) < 2:
+                continue
             try:
-                idle = human_duration(int(time.time()) - int(activity))
+                idle = human_duration(int(time.time()) - int(parts[1]))
             except ValueError:
                 idle = "?"
-            rows.append(("Client", "%s  (idle %s)" % (tty, idle)))
+            rows.append(("Client", "%s  (idle %s)" % (parts[0], idle)))
 
     code, out = tmux_run(
         session.socket, "list-panes", "-s", "-t", "=" + session.name,
-        "-F", SEP.join(("#{window_index}.#{pane_index}", "#{pane_current_command}", "#{pane_pid}")),
+        "-F", " ".join(
+            [MARK + "#{window_index}.#{pane_index}"]
+            + [field(f) for f in ("pane_current_command", "pane_pid")]
+        ),
     )
     if code == 0 and out:
         for line in out.splitlines():
-            parts = line.split(SEP)
-            if len(parts) == 3:
+            parts = split_fields(line)
+            if len(parts) >= 3:
                 rows.append(("Pane %s" % parts[0], "%s  (pid %s)" % (parts[1], parts[2])))
 
     invocation = claude_invocation(session)
