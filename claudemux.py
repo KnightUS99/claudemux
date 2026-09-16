@@ -31,7 +31,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
 VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
@@ -57,8 +57,36 @@ CLAUDE_CANDIDATES = (
 # --------------------------------------------------------------------------
 
 def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[valid-type]
+    # Raised rather than written: inside curses, anything printed to stderr is
+    # wiped when the screen is restored, so the user sees a silent exit. As a
+    # SystemExit argument the message is printed by the interpreter on the way
+    # out, once the terminal is back to normal.
+    if code == 1:
+        raise SystemExit("claudemux: %s" % msg)
     sys.stderr.write("claudemux: %s\n" % msg)
     raise SystemExit(code)
+
+
+def tmux_install_hint() -> str:
+    for binary, command in (
+        ("apt-get", "apt install tmux"),
+        ("dnf", "dnf install tmux"),
+        ("yum", "yum install tmux"),
+        ("apk", "apk add tmux"),
+        ("pacman", "pacman -S tmux"),
+        ("zypper", "zypper install tmux"),
+        ("brew", "brew install tmux"),
+    ):
+        if shutil.which(binary):
+            return command
+    return "install tmux with your package manager"
+
+
+def require_tmux() -> None:
+    """Check before curses starts, so the message has somewhere to land."""
+    if shutil.which("tmux") is None:
+        die("tmux is not installed - claudemux needs it to run.\n"
+            "Install it with:  %s" % tmux_install_hint())
 
 
 def sanitize(text: str) -> str:
@@ -136,7 +164,8 @@ def tmux_run(socket: Optional[str], *args: str) -> Tuple[int, str]:
             universal_newlines=True,
         )
     except FileNotFoundError:
-        die("tmux is not installed")
+        die("tmux is not installed - claudemux needs it to run.\n"
+            "Install it with:  %s" % tmux_install_hint())
     return proc.returncode, proc.stdout.strip()
 
 
@@ -1049,6 +1078,7 @@ class Browser:
 
 
 def run_browser(all_users: bool) -> int:
+    require_tmux()
     if not sys.stdout.isatty():
         die("no terminal available - use --list instead")
     action = curses.wrapper(lambda screen: Browser(screen, all_users).run())

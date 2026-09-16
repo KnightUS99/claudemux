@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.3
+
+- Errors raised while the browser is on screen are no longer swallowed. Running
+  `claudemux` with no arguments on a machine without tmux exited silently,
+  because the message was written to stderr while curses held the screen and
+  was wiped by the teardown.
+- The missing-tmux message now names the one install command that fits the
+  machine (`apt install tmux`, `dnf install tmux`, ...) instead of a menu, and
+  the installer ends with it as a NEXT STEP rather than a warning scrolled off
+  the top.
+
 ## 1.2.2
 
 - `--update` and `--check-update` ask the releases API, which is not behind

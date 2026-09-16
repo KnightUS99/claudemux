@@ -40,9 +40,18 @@ for candidate in python3 python3.13 python3.12 python3.11 python3.10 python3.9 p
 done
 [ -n "$python" ] || fail "python 3.7 or newer is required but was not found"
 
+tmux_command=""
 if ! command -v tmux >/dev/null 2>&1; then
-    warn "tmux is not installed - claudemux needs it at runtime. Install with one of:
-    dnf install tmux    |    apt install tmux    |    apk add tmux    |    brew install tmux"
+    # Name the one command that fits this machine, not a menu of four.
+    for pair in "apt-get:apt install tmux" "dnf:dnf install tmux" "yum:yum install tmux" \
+                "apk:apk add tmux" "pacman:pacman -S tmux" "zypper:zypper install tmux" \
+                "brew:brew install tmux"; do
+        if command -v "${pair%%:*}" >/dev/null 2>&1; then
+            tmux_command=${pair#*:}
+            break
+        fi
+    done
+    [ -n "$tmux_command" ] || tmux_command="install tmux with your package manager"
 fi
 
 # --- fetch ------------------------------------------------------------------
@@ -84,7 +93,15 @@ case ":${PATH}:" in
     echo 'export PATH=\"$target_dir:\$PATH\"' >> ~/.bashrc" ;;
 esac
 note ""
-note "  claudemux            browse your sessions"
-note "  claudemux -n api     start or reattach claude-$(id -un)-api"
-note "  claudemux --help     everything else"
-note ""
+if [ -n "$tmux_command" ]; then
+    # Last thing on screen, because claudemux cannot do anything without it.
+    note "NEXT STEP: claudemux needs tmux, which is not installed yet:"
+    note ""
+    note "    $tmux_command"
+    note ""
+else
+    note "  claudemux            browse your sessions"
+    note "  claudemux -n api     start or reattach claude-$(id -un)-api"
+    note "  claudemux --help     everything else"
+    note ""
+fi

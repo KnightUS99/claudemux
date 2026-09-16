@@ -165,6 +165,25 @@ class TestServerDiscovery(unittest.TestCase):
         self.assertEqual(servers[0], (os.getuid(), None))
 
 
+class TestErrorReporting(unittest.TestCase):
+    def test_die_carries_its_message_on_the_exception(self):
+        """Inside curses, stderr is wiped by the teardown; the message has to
+        ride out on SystemExit or the user sees a silent exit."""
+        with self.assertRaises(SystemExit) as caught:
+            claudemux.die("something went wrong")
+        self.assertIn("something went wrong", str(caught.exception))
+
+    def test_a_non_default_exit_code_is_preserved(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                claudemux.die("nope", 3)
+        self.assertEqual(caught.exception.code, 3)
+
+    def test_install_hint_always_says_something(self):
+        self.assertTrue(claudemux.tmux_install_hint())
+        self.assertIn("tmux", claudemux.tmux_install_hint())
+
+
 class TestVersioning(unittest.TestCase):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
