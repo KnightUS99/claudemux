@@ -31,7 +31,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
 VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
@@ -773,9 +773,19 @@ class Browser:
         left = " claudemux %s   %s@%s   [%s]" % (
             __version__, username(os.getuid()), host, scope,
         )
-        right = "%d session%s " % (len(self.sessions), "" if len(self.sessions) == 1 else "s")
+        # Richest right-hand side that still fits; a truncated "press u" helps
+        # nobody, so drop detail rather than let it run off the edge.
+        count = "%d session%s" % (len(self.sessions), "" if len(self.sessions) == 1 else "s")
+        candidates = []
         if self.update:
-            right = "update %s available - press u   %s" % (self.update, right)
+            candidates += [
+                "update %s available - press u   %s " % (self.update, count),
+                "update %s (u)   %s " % (self.update, count),
+                "update %s (u) " % self.update,
+                "update (u) ",
+            ]
+        candidates += [count + " ", ""]
+        right = next(c for c in candidates if len(left) + len(c) <= width)
         gap = max(1, width - len(left) - len(right))
         self.write(0, 0, (left + " " * gap + right)[:width], self.theme.header)
 

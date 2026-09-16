@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+
+- The update notice in the header no longer runs off the edge of a narrow
+  terminal: it drops the session count, then shortens itself, rather than
+  truncating mid-word.
+
 ## 1.2.0
 
 - `--update` updates claudemux in place, and `--check-update` just looks.
