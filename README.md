@@ -9,14 +9,20 @@ session browser; run it as root and the browser shows every user's sessions on t
 One file, standard library only, no runtime dependencies beyond `tmux` and `python3`.
 
 ```
- claudemux 1.0.0   root@vmi3465112   [all users]
-  SESSION                OWNER       W STATE     UPTIME   IDLE    DIRECTORY
-> claude-root-api        root        1 attached  2h14m    3s      ~
-  claude-root-configs    root        1 detached  17s      17s     /etc
-  claude-jaime-website   jaime       2 detached  16s      16s     /home/jaime
+ claudemux 1.1.0   root@vmi3465112   [all users]                       4 sessions
+  SESSION                      OWNER       W STATE     UPTIME   IDLE    DIRECTORY
+> claude-root-api              root        1 attached  2h14m    3s      ~
+  claude-root-configs          root        1 detached  17s      17s     /etc
+  claude-jaime-website         jaime       2 detached  16s      16s     /home/jaime
+  claude-ztasks-v2-elcielo-dev ztasks      1 detached  2m32s    45s     ~/public_html
 
   ENTER attach  n new  x kill  r rename  d details  / filter  ? help  q quit
 ```
+
+Attached sessions are green, other users' are marked in yellow, and the bars are
+colour-blocked; on a terminal without colour it falls back to bold, reverse and dim.
+Session names get the width they need - the directory column shrinks, and drops off a
+narrow terminal, rather than truncating every name.
 
 ## Install
 

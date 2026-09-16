@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 PREFIX = "claude"
 MARK = "v"  # see field(): keeps an empty value from vanishing when we split
@@ -475,6 +475,59 @@ def session_details(session: Session) -> List[Tuple[str, str]]:
 # interactive browser
 # --------------------------------------------------------------------------
 
+class Theme:
+    """Screen attributes, resolved once curses is up.
+
+    Falls back to bold/reverse/dim on a terminal without colour, so the
+    layout still reads the same over a plain serial console or TERM=vt100.
+    """
+
+    def __init__(self) -> None:
+        self.header = curses.A_REVERSE | curses.A_BOLD
+        self.footer = curses.A_REVERSE
+        self.column = curses.A_BOLD
+        self.selected = curses.A_REVERSE | curses.A_BOLD
+        self.name = curses.A_NORMAL
+        self.owner_other = curses.A_DIM
+        self.attached = curses.A_BOLD
+        self.detached = curses.A_DIM
+        self.path = curses.A_DIM
+        self.message = curses.A_BOLD
+        self.title = curses.A_BOLD
+
+    def setup(self) -> None:
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        try:
+            curses.use_default_colors()   # keep the terminal's own background
+        except curses.error:
+            pass
+        definitions = (
+            (1, curses.COLOR_WHITE, curses.COLOR_BLUE),    # bars
+            (2, curses.COLOR_CYAN, -1),                    # column headings
+            (3, curses.COLOR_GREEN, -1),                   # attached
+            (4, curses.COLOR_YELLOW, -1),                  # another user
+            (5, curses.COLOR_MAGENTA, -1),                 # messages
+        )
+        for index, foreground, background in definitions:
+            try:
+                curses.init_pair(index, foreground, background)
+            except curses.error:
+                return
+        self.header = curses.color_pair(1) | curses.A_BOLD
+        self.footer = curses.color_pair(1)
+        self.column = curses.color_pair(2) | curses.A_BOLD
+        self.selected = curses.A_REVERSE | curses.A_BOLD
+        self.name = curses.A_NORMAL
+        self.owner_other = curses.color_pair(4)
+        self.attached = curses.color_pair(3) | curses.A_BOLD
+        self.detached = curses.A_DIM
+        self.path = curses.A_DIM
+        self.message = curses.color_pair(5) | curses.A_BOLD
+        self.title = curses.color_pair(2) | curses.A_BOLD
+
+
 HELP_LINES = [
     "  ENTER   attach to the selected session",
     "  n       new session (asks for a name, starts in the current directory)",
@@ -504,6 +557,7 @@ class Browser:
         self.detail_of: Optional[Session] = None
         self.action: Optional[Tuple[str, object]] = None
         self.last_load = 0.0
+        self.theme = Theme()
 
     # -- data ------------------------------------------------------------
     def load(self) -> None:
@@ -551,19 +605,33 @@ class Browser:
             return
 
         scope = "all users" if self.all_users and os.getuid() == 0 else "mine"
-        header = " claudemux %s   %s@%s   [%s]" % (
-            __version__, username(os.getuid()), os.uname().nodename, scope,
+        host = os.uname().nodename.split(".")[0]   # the fqdn crowds out the rest
+        left = " claudemux %s   %s@%s   [%s]" % (
+            __version__, username(os.getuid()), host, scope,
         )
-        self.write(0, 0, header.ljust(width), curses.A_REVERSE)
+        right = "%d session%s " % (len(self.sessions), "" if len(self.sessions) == 1 else "s")
+        gap = max(1, width - len(left) - len(right))
+        self.write(0, 0, (left + " " * gap + right)[:width], self.theme.header)
 
         rows = self.visible
         show_owner = self.all_users and os.getuid() == 0
-        name_width = max(18, min(34, width - (58 if show_owner else 48)))
+        # Session names carry the most meaning, so they get the space first and
+        # the directory column takes what is left - or goes away on a narrow
+        # terminal rather than truncating every name.
+        fixed = 2 + (11 if show_owner else 0) + 3 + 10 + 9 + 8
+        longest = max([len(s.name) for s in rows] + [len("SESSION")])
+        room = max(10, width - fixed)
+        name_width = min(longest, room)
+        path_width = room - name_width
+        show_path = path_width >= 12
+
         columns = "  %-*s " % (name_width, "SESSION")
         if show_owner:
             columns += "%-10s " % "OWNER"
-        columns += "%2s %-9s %-8s %-7s %s" % ("W", "STATE", "UPTIME", "IDLE", "DIRECTORY")
-        self.write(1, 0, columns, curses.A_BOLD)
+        columns += "%2s %-9s %-8s %-7s" % ("W", "STATE", "UPTIME", "IDLE")
+        if show_path:
+            columns += " DIRECTORY"
+        self.write(1, 0, columns.ljust(width), self.theme.column)
 
         body_top, body_bottom = 2, height - 3
         capacity = max(1, body_bottom - body_top)
@@ -572,32 +640,41 @@ class Browser:
         if not rows:
             empty = "nothing matches %r" % self.filter if self.filter else \
                 "no sessions yet - press n to start one"
-            self.write(body_top + 1, 2, empty, curses.A_DIM)
+            self.write(body_top + 1, 2, empty, self.theme.detached)
 
         for offset, session in enumerate(rows[start:start + capacity]):
             y = body_top + offset
             selected = (start + offset) == self.index
-            line = "%s %-*s " % (">" if selected else " ", name_width, session.name[:name_width])
+            theme = self.theme
+
+            segments = [("%s %-*s " % (">" if selected else " ", name_width,
+                                       session.name[:name_width]), theme.name)]
             if show_owner:
-                line += "%-10s " % session.owner[:10]
-            line += "%2d %-9s %-8s %-7s %s" % (
-                session.windows, session.state,
-                human_duration(session.uptime), human_duration(session.idle),
-                shorten_path(session.path, max(10, width - len(line) - 32)),
-            )
-            attr = curses.A_REVERSE if selected else curses.A_NORMAL
-            if not selected and session.attached:
-                attr |= curses.A_BOLD
-            if not selected and not session.mine:
-                attr |= curses.A_DIM
-            self.write(y, 0, line.ljust(width), attr)
+                segments.append(("%-10s " % session.owner[:10],
+                                 theme.name if session.mine else theme.owner_other))
+            segments.append(("%2d " % session.windows, theme.detached))
+            segments.append(("%-9s " % session.state,
+                             theme.attached if session.attached else theme.detached))
+            segments.append(("%-8s %-7s " % (human_duration(session.uptime),
+                                             human_duration(session.idle)), theme.name))
+            if show_path:
+                segments.append((shorten_path(session.path, max(10, path_width - 1)), theme.path))
+
+            if selected:
+                whole = "".join(text for text, _ in segments)
+                self.write(y, 0, whole.ljust(width), theme.selected)
+            else:
+                column = 0
+                for text, attr in segments:
+                    self.write(y, column, text, attr)
+                    column += len(text)
 
         footer = "  ENTER attach  n new  x kill  r rename  d details  / filter  ? help  q quit"
         if self.filter:
             footer = "  filter: %s   (ESC clears)  |%s" % (self.filter, footer)
         self.write(height - 2, 0, self.message.ljust(width),
-                   curses.A_BOLD if self.message else curses.A_NORMAL)
-        self.write(height - 1, 0, footer.ljust(width), curses.A_REVERSE)
+                   self.theme.message if self.message else curses.A_NORMAL)
+        self.write(height - 1, 0, footer.ljust(width), self.theme.footer)
 
         if self.show_help:
             self.overlay("keys", HELP_LINES)
@@ -619,10 +696,11 @@ class Browser:
         window.erase()
         window.box()
         try:
-            window.addnstr(0, 2, " %s " % title, box_width - 4, curses.A_BOLD)
+            window.addnstr(0, 2, " %s " % title, box_width - 4, self.theme.title)
             for offset, line in enumerate(lines[:box_height - 4]):
                 window.addnstr(2 + offset, 1, line, box_width - 2)
-            window.addnstr(box_height - 1, 2, " any key to close ", box_width - 4, curses.A_DIM)
+            window.addnstr(box_height - 1, 2, " any key to close ", box_width - 4,
+                           self.theme.detached)
         except curses.error:
             pass
         window.refresh()
@@ -691,6 +769,7 @@ class Browser:
 
     # -- main loop -------------------------------------------------------
     def run(self) -> Optional[Tuple[str, object]]:
+        self.theme.setup()
         curses.curs_set(0)
         self.screen.timeout(int(self.REFRESH_SECONDS * 1000))
         self.load()
