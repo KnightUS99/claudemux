@@ -31,10 +31,11 @@ import urllib.request
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
 VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
+RELEASES_URL = "https://api.github.com/repos/%s/releases/latest" % REPO
 SCRIPT_URL = "https://raw.githubusercontent.com/%s/%%s/claudemux.py" % REPO
 UPDATE_CHECK_INTERVAL = 24 * 3600
 
@@ -333,14 +334,42 @@ def write_cache(data: dict) -> None:
 
 
 def fetch_url(url: str, timeout: float, limit: int = 4 * 1024 * 1024) -> Optional[bytes]:
+    # The GitHub API rejects requests without a User-Agent.
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "claudemux/%s (+https://github.com/%s)" % (__version__, REPO)}
+    )
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.read(limit)
     except Exception:
         return None  # offline, blocked, rate-limited: never a hard failure
 
 
-def fetch_latest_version(timeout: float = 3.0) -> Optional[str]:
+def parse_release_tag(payload: bytes) -> Optional[str]:
+    try:
+        data = json.loads(payload.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    tag = str(data.get("tag_name") or "").strip().lstrip("vV")
+    return tag if re.match(r"^\d+(\.\d+)*$", tag) else None
+
+
+def fetch_latest_version(timeout: float = 3.0, authoritative: bool = False) -> Optional[str]:
+    """Latest published version, or None if it cannot be determined.
+
+    raw.githubusercontent serves VERSION with max-age=300, so for five minutes
+    after a release it still reports the previous one - precisely when someone
+    runs --update. An explicit check therefore asks the releases API first,
+    which is not behind that cache, and falls back to the raw file if the API
+    is unreachable or rate-limited. The daily background check just uses the
+    raw file: cheap, and five minutes does not matter once a day.
+    """
+    if authoritative:
+        payload = fetch_url(RELEASES_URL, timeout, limit=256 * 1024)
+        if payload is not None:
+            tag = parse_release_tag(payload)
+            if tag:
+                return tag
     raw = fetch_url(VERSION_URL, timeout, limit=64)
     if raw is None:
         return None
@@ -377,7 +406,7 @@ def cached_update() -> Optional[str]:
 
 def cmd_update(check_only: bool = False) -> int:
     target = os.path.realpath(sys.argv[0])
-    latest = fetch_latest_version(timeout=10.0)
+    latest = fetch_latest_version(timeout=10.0, authoritative=True)
     if latest is None:
         die("could not reach github to check for updates")
     write_cache({"checked": time.time(), "latest": latest})

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.2
+
+- `--update` and `--check-update` ask the releases API, which is not behind
+  the five-minute CDN cache on raw.githubusercontent - running `--update`
+  just after a release no longer reports "up to date". The daily background
+  check still uses the cheap raw file.
+
 ## 1.2.1
 
 - The update notice in the header no longer runs off the edge of a narrow

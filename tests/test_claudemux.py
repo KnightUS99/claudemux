@@ -190,6 +190,20 @@ class TestVersioning(unittest.TestCase):
         self.assertEqual(claudemux.version_tuple("weird"), (0,))
 
 
+class TestReleaseParsing(unittest.TestCase):
+    def test_reads_the_tag(self):
+        self.assertEqual(claudemux.parse_release_tag(b'{"tag_name": "v1.2.2"}'), "1.2.2")
+
+    def test_tolerates_a_missing_v(self):
+        self.assertEqual(claudemux.parse_release_tag(b'{"tag_name": "1.2.2"}'), "1.2.2")
+
+    def test_rejects_junk(self):
+        self.assertIsNone(claudemux.parse_release_tag(b"not json"))
+        self.assertIsNone(claudemux.parse_release_tag(b"{}"))
+        self.assertIsNone(claudemux.parse_release_tag(b'{"tag_name": "nightly"}'))
+        self.assertIsNone(claudemux.parse_release_tag(b'{"message": "rate limited"}'))
+
+
 class TestUpdateCache(unittest.TestCase):
     """cached_update() sits on the launch path, so it must never do i/o."""
 
