@@ -33,8 +33,8 @@ jobs:
           python claudemux.py -l --json | python -c 'import json,sys; assert json.load(sys.stdin)[0]["name"].endswith("-ci")'
           python claudemux.py -k ci
 
-      - name: diagnostics
-        if: always()
+      - name: diagnostics (only when something broke)
+        if: failure()
         run: |
           export CLAUDE_BIN=/tmp/fake-claude
           python claudemux.py --detach -n diag || true
