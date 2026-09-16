@@ -1,0 +1,39 @@
+# System-wide tmux defaults. Read by every user before ~/.tmux.conf,
+# so anything here can be overridden per-account.
+
+# Scrollback: mouse wheel scrolls, click to select panes/windows.
+set -g mouse on
+set -g history-limit 50000
+
+# vi keys in copy mode (h/j/k/l, /search, v select, y yank).
+setw -g mode-keys vi
+
+# Bare PageUp enters scrollback like screen does, but stays out of the way
+# of full-screen programs (less, vim, man) that handle PageUp themselves.
+bind -n PPage if-shell -F '#{alternate_on}' 'send-keys PPage' 'copy-mode -u'
+
+# Status bar: session name on the left, who owns this tmux server on the right,
+# so an su'd shell is never mistaken for another account's session.
+set -g status-left ' #S '
+set -g status-left-length 40
+# Resolved once at server start rather than as a #() poll, which shows
+# "<'id -un' not ready>" until the first status refresh.
+run-shell -b 'tmux set -g status-right " $(id -un)@#h  %H:%M "'
+set -g status-right-length 40
+
+# Windows number from 1; renumber when one closes.
+set -g base-index 1
+setw -g pane-base-index 1
+set -g renumber-windows on
+
+# Sane terminal behaviour.
+set -g default-terminal "screen-256color"
+set -sg escape-time 10
+set -g focus-events on
+set -g display-time 2000
+
+# Coming from screen? Uncomment to move the prefix from C-b back to C-a.
+# Note: this shadows bash's "jump to start of line"; C-a a sends a literal C-a.
+# unbind C-b
+# set -g prefix C-a
+# bind C-a send-prefix
