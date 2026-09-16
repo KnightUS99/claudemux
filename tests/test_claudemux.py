@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import tempfile
 import sys
 import time
 import unittest
@@ -162,6 +163,71 @@ class TestServerDiscovery(unittest.TestCase):
     def test_own_server_is_always_first(self):
         servers = claudemux.discover_servers(all_users=False)
         self.assertEqual(servers[0], (os.getuid(), None))
+
+
+class TestVersioning(unittest.TestCase):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_version_file_matches_the_module(self):
+        """The update check compares against VERSION, so drift would either
+        hide a release or offer an update that is already installed."""
+        with open(os.path.join(self.root, "VERSION")) as handle:
+            self.assertEqual(handle.read().strip(), claudemux.__version__)
+
+    def test_changelog_documents_the_current_version(self):
+        with open(os.path.join(self.root, "CHANGELOG.md")) as handle:
+            self.assertIn("## %s" % claudemux.__version__, handle.read())
+
+    def test_version_ordering(self):
+        self.assertTrue(claudemux.is_newer("1.2.0", "1.1.9"))
+        self.assertTrue(claudemux.is_newer("1.10.0", "1.9.0"))
+        self.assertFalse(claudemux.is_newer("1.2.0", "1.2.0"))
+        self.assertFalse(claudemux.is_newer("1.1.0", "1.2.0"))
+
+    def test_version_tuple_tolerates_junk(self):
+        self.assertEqual(claudemux.version_tuple("1.2.3"), (1, 2, 3))
+        self.assertEqual(claudemux.version_tuple("1.2.0rc1"), (1, 2, 0))
+        self.assertEqual(claudemux.version_tuple("weird"), (0,))
+
+
+class TestUpdateCache(unittest.TestCase):
+    """cached_update() sits on the launch path, so it must never do i/o."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.previous = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = self.directory.name
+        os.environ.pop("CLAUDEMUX_NO_UPDATE_CHECK", None)
+
+    def tearDown(self):
+        if self.previous is None:
+            os.environ.pop("XDG_CACHE_HOME", None)
+        else:
+            os.environ["XDG_CACHE_HOME"] = self.previous
+        self.directory.cleanup()
+
+    def test_no_cache_means_no_notice(self):
+        self.assertIsNone(claudemux.cached_update())
+
+    def test_a_newer_cached_version_is_reported(self):
+        claudemux.write_cache({"checked": time.time(), "latest": "99.0.0"})
+        self.assertEqual(claudemux.cached_update(), "99.0.0")
+
+    def test_an_older_cached_version_is_ignored(self):
+        claudemux.write_cache({"checked": time.time(), "latest": "0.0.1"})
+        self.assertIsNone(claudemux.cached_update())
+
+    def test_the_env_switch_silences_it(self):
+        claudemux.write_cache({"checked": time.time(), "latest": "99.0.0"})
+        os.environ["CLAUDEMUX_NO_UPDATE_CHECK"] = "1"
+        self.assertIsNone(claudemux.cached_update())
+
+    def test_a_corrupt_cache_is_survivable(self):
+        os.makedirs(os.path.dirname(claudemux.cache_file()), exist_ok=True)
+        with open(claudemux.cache_file(), "w") as handle:
+            handle.write("not json at all")
+        self.assertEqual(claudemux.read_cache(), {})
+        self.assertIsNone(claudemux.cached_update())
 
 
 class TestCli(unittest.TestCase):

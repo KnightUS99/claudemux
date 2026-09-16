@@ -9,7 +9,7 @@ session browser; run it as root and the browser shows every user's sessions on t
 One file, standard library only, no runtime dependencies beyond `tmux` and `python3`.
 
 ```
- claudemux 1.1.0   root@vmi3465112   [all users]                       4 sessions
+ claudemux 1.2.0   root@vmi3465112   [all users]                       4 sessions
   SESSION                      OWNER       W STATE     UPTIME   IDLE    DIRECTORY
 > claude-root-api              root        1 attached  2h14m    3s      ~
   claude-root-configs          root        1 detached  17s      17s     /etc
@@ -120,6 +120,25 @@ setw -g mode-keys vi
 
 Drop it in `~/.tmux.conf`, or in `/etc/tmux.conf` to set it for every account. With mouse
 mode on, hold **Shift** while dragging for your terminal's own copy/paste.
+
+## Updating
+
+```sh
+claudemux --update          # update in place
+claudemux --check-update    # just look
+```
+
+The browser checks once a day in the background and offers `u` when there is
+something newer; launching a session prints a one-line notice. The check is cached,
+never blocks startup, and `CLAUDEMUX_NO_UPDATE_CHECK=1` turns it off entirely.
+Updates are verified before they are swapped in atomically, and the interpreter the
+installer pinned is preserved.
+
+To install a specific version instead, point the installer at that tag:
+
+```sh
+CLAUDEMUX_REF=v1.1.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/KnightUS99/claudemux/main/install.sh)"
+```
 
 ## Requirements
 

@@ -14,8 +14,10 @@ Single file, standard library only, Python 3.9+.
 
 from __future__ import annotations
 
+import ast
 import curses
 import glob
+import json
 import os
 import pwd
 import re
@@ -23,11 +25,18 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+
+REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
+VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
+SCRIPT_URL = "https://raw.githubusercontent.com/%s/%%s/claudemux.py" % REPO
+UPDATE_CHECK_INTERVAL = 24 * 3600
 
 PREFIX = "claude"
 MARK = "v"  # see field(): keeps an empty value from vanishing when we split
@@ -284,6 +293,155 @@ def find_session(name: str, all_users: bool = False) -> Optional[Session]:
 
 
 # --------------------------------------------------------------------------
+# updates
+# --------------------------------------------------------------------------
+
+def version_tuple(version: str) -> Tuple[int, ...]:
+    parts = []
+    for chunk in version.split("."):
+        digits = re.match(r"\d+", chunk)
+        parts.append(int(digits.group()) if digits else 0)
+    return tuple(parts)
+
+
+def is_newer(candidate: str, current: str) -> bool:
+    return version_tuple(candidate) > version_tuple(current)
+
+
+def cache_file() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "claudemux", "update.json")
+
+
+def read_cache() -> dict:
+    try:
+        with open(cache_file()) as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_cache(data: dict) -> None:
+    path = cache_file()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            json.dump(data, handle)
+    except OSError:
+        pass  # a read-only home is not a reason to fail
+
+
+def fetch_url(url: str, timeout: float, limit: int = 4 * 1024 * 1024) -> Optional[bytes]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.read(limit)
+    except Exception:
+        return None  # offline, blocked, rate-limited: never a hard failure
+
+
+def fetch_latest_version(timeout: float = 3.0) -> Optional[str]:
+    raw = fetch_url(VERSION_URL, timeout, limit=64)
+    if raw is None:
+        return None
+    text = raw.decode("utf-8", "replace").strip()
+    return text if re.match(r"^\d+(\.\d+)*$", text) else None
+
+
+def update_available(force: bool = False, timeout: float = 3.0) -> Optional[str]:
+    """Latest version if it is newer than us, else None.
+
+    Answers from a day-old cache so startup never waits on the network; only
+    a stale cache triggers a fetch. Set CLAUDEMUX_NO_UPDATE_CHECK=1 to disable.
+    """
+    if os.environ.get("CLAUDEMUX_NO_UPDATE_CHECK"):
+        return None
+    cache = read_cache()
+    if force or time.time() - cache.get("checked", 0) > UPDATE_CHECK_INTERVAL:
+        latest = fetch_latest_version(timeout)
+        # Record the attempt either way, so an offline box retries tomorrow
+        # rather than on every single launch.
+        cache = {"checked": time.time(), "latest": latest or cache.get("latest")}
+        write_cache(cache)
+    latest = cache.get("latest")
+    return latest if latest and is_newer(latest, __version__) else None
+
+
+def cached_update() -> Optional[str]:
+    """Cache-only check: no network, safe on the hot path."""
+    if os.environ.get("CLAUDEMUX_NO_UPDATE_CHECK"):
+        return None
+    latest = read_cache().get("latest")
+    return latest if latest and is_newer(latest, __version__) else None
+
+
+def cmd_update(check_only: bool = False) -> int:
+    target = os.path.realpath(sys.argv[0])
+    latest = fetch_latest_version(timeout=10.0)
+    if latest is None:
+        die("could not reach github to check for updates")
+    write_cache({"checked": time.time(), "latest": latest})
+
+    if not is_newer(latest, __version__):
+        print("claudemux %s is up to date" % __version__)
+        return 0
+    print("claudemux %s is available (you have %s)" % (latest, __version__))
+    if check_only:
+        print("update with: claudemux --update")
+        return 0
+
+    if not os.access(os.path.dirname(target) or ".", os.W_OK):
+        die("cannot write to %s - try: sudo claudemux --update" % target)
+
+    payload = None
+    for ref in ("v%s" % latest, "main"):   # prefer the tag, fall back to main
+        payload = fetch_url(SCRIPT_URL % ref, timeout=30.0)
+        if payload:
+            break
+    if not payload:
+        die("could not download claudemux %s" % latest)
+
+    text = payload.decode("utf-8", "replace")
+    try:
+        ast.parse(text)
+    except SyntaxError:
+        die("downloaded file is not valid python - refusing to install it")
+    if '__version__ = "%s"' % latest not in text:
+        die("downloaded file does not declare version %s - refusing to install it" % latest)
+
+    # Keep the interpreter the installer pinned, rather than whatever the
+    # published file happens to say.
+    current_shebang = ""
+    try:
+        with open(target) as handle:
+            first = handle.readline().rstrip("\n")
+        if first.startswith("#!"):
+            current_shebang = first
+    except OSError:
+        pass
+    if current_shebang:
+        lines = text.split("\n")
+        lines[0] = current_shebang
+        text = "\n".join(lines)
+
+    temporary = target + ".new"
+    try:
+        with open(temporary, "w") as handle:
+            handle.write(text)
+        os.chmod(temporary, os.stat(target).st_mode & 0o7777)
+        os.replace(temporary, target)   # atomic: never a half-written binary
+    except OSError as error:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        die("could not replace %s: %s" % (target, error))
+
+    print("updated %s -> %s  (%s)" % (__version__, latest, target))
+    return 0
+
+
+# --------------------------------------------------------------------------
 # launching claude
 # --------------------------------------------------------------------------
 
@@ -395,6 +553,10 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
         )
     else:
         print("Reattaching to existing session: %s" % session_name)
+
+    pending = cached_update()
+    if pending:
+        print("claudemux %s is available - update with: claudemux --update" % pending)
 
     if detach:
         print("Attach with: claudemux -a %s   (or: tmux a -t %s)" % (session_name, session_name))
@@ -537,6 +699,7 @@ HELP_LINES = [
     "  /       filter by name, owner or directory     ESC clears",
     "  j / k   move down / up            g / G   first / last",
     "  a       toggle all users / just me            (root only)",
+    "  u       update claudemux when a newer version is available",
     "  R       refresh now               q       quit",
 ]
 
@@ -558,6 +721,7 @@ class Browser:
         self.action: Optional[Tuple[str, object]] = None
         self.last_load = 0.0
         self.theme = Theme()
+        self.update: Optional[str] = None
 
     # -- data ------------------------------------------------------------
     def load(self) -> None:
@@ -610,6 +774,8 @@ class Browser:
             __version__, username(os.getuid()), host, scope,
         )
         right = "%d session%s " % (len(self.sessions), "" if len(self.sessions) == 1 else "s")
+        if self.update:
+            right = "update %s available - press u   %s" % (self.update, right)
         gap = max(1, width - len(left) - len(right))
         self.write(0, 0, (left + " " * gap + right)[:width], self.theme.header)
 
@@ -768,8 +934,19 @@ class Browser:
         self.action = ("new", name or default)
 
     # -- main loop -------------------------------------------------------
+    def check_for_update(self) -> None:
+        """Off the main loop: the browser redraws every couple of seconds, so
+        the notice appears on its own once the answer arrives."""
+        def worker() -> None:
+            try:
+                self.update = update_available()
+            except Exception:
+                self.update = None
+        threading.Thread(target=worker, daemon=True).start()
+
     def run(self) -> Optional[Tuple[str, object]]:
         self.theme.setup()
+        self.check_for_update()
         curses.curs_set(0)
         self.screen.timeout(int(self.REFRESH_SECONDS * 1000))
         self.load()
@@ -813,6 +990,10 @@ class Browser:
                 self.detail_of = self.selected
             elif key == ord("?"):
                 self.show_help = True
+            elif key == ord("u"):
+                if self.update:
+                    return ("update", self.update)
+                self.message = "claudemux %s is the latest version" % __version__
             elif key == ord("R"):
                 self.load()
                 self.message = "refreshed"
@@ -839,6 +1020,8 @@ def run_browser(all_users: bool) -> int:
         attach(payload)  # type: ignore[arg-type]
     if kind == "new":
         return launch(str(payload), [], want_rc=True, detach=False)
+    if kind == "update":
+        return cmd_update()
     return 0
 
 
@@ -862,6 +1045,7 @@ enabled by default. Sessions are named claude-<user>-<directory>.
   -k, --kill NAME   kill a session
       --all         include every user's sessions (root only)
       --mine        only your own sessions
+      --update      update claudemux in place   --check-update  just look
   -h, --help        this help               -V, --version
                     (claudemux -- --help shows Claude's own help)
 
@@ -975,6 +1159,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif arg in ("-V", "--version"):
             print("claudemux %s" % __version__)
             return 0
+        elif arg == "--update":
+            return cmd_update()
+        elif arg == "--check-update":
+            return cmd_update(check_only=True)
         elif arg == "--":
             extra.extend(args)
             break

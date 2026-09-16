@@ -24,6 +24,11 @@ jobs:
       - name: tmux version
         run: tmux -V
 
+      - name: version metadata agrees
+        run: |
+          test "$(cat VERSION)" = "$(python -c 'import claudemux; print(claudemux.__version__)')"
+          grep -q "^## $(cat VERSION)$" CHANGELOG.md
+
       - name: end-to-end (create, list, kill a real session)
         run: |
           printf '#!/bin/sh\nsleep 60\n' > /tmp/fake-claude && chmod +x /tmp/fake-claude
