@@ -37,11 +37,33 @@ to `claude` untouched.
 **tmux is the only state.** Sessions are discovered by querying tmux, never tracked
 in a file. The sole persisted state is the update-check cache in `~/.cache/claudemux/`.
 
-**One name, three places.** `full_name()` produces `claude-<user>-<directory>` and
-that string is given to tmux, to Claude's Remote Control (`--rc`) and to Claude's
-`-n` display name, so a session is recognisable wherever it is seen. Changing the
-naming scheme means changing what reattaches: `launch()` also looks for a session
-under the older `claude-<directory>` scheme before creating a new one.
+**One name, three places.** `full_name()` produces `claude-<server>-<user>-<directory>`
+and that string is given to tmux, to Claude's Remote Control (`--rc`) and to Claude's
+`-n` display name, so a session is recognisable wherever it is seen - including in
+Remote Control, where sessions from every machine appear together and `<server>` is
+the only thing telling them apart.
+
+Changing the naming scheme means changing what reattaches. `legacy_names()` lists the
+older schemes newest-first and both `launch()` and `resolve()` walk it before giving
+up, so a session started by an older build is still found. Add to that list rather
+than replacing it; the entries are the wire format of every session already running.
+
+Three functions take a name apart and they are not interchangeable:
+
+| | returns for `claude-box1-root-api` | used by |
+| --- | --- | --- |
+| `short_name()` | `root-api` | the browser's SESSION column |
+| `base_name(name, user)` | `api` | the rename prefill |
+| neither | `claude-box1-root-api` | `-l`, the details pane, tmux itself |
+
+`base_name()` exists because rename feeds its prefill straight back into `full_name()`:
+prefilling `short_name()` leaves the user on the front and renaming appends it a second
+time, producing `claude-box1-root-root-api`. There is a test named for that bug.
+
+**The server name is read, not computed.** `server_name()` checks `$CLAUDEMUX_SERVER`,
+then each of `SERVER_FILES`, and only falls back to the short hostname - so renaming a
+host does not silently rename every session. It is `lru_cache`d, so any test that
+varies it must `server_name.cache_clear()`; `pinned_server()` in the suite does both.
 
 **One tmux server per user.** `discover_servers()` returns this user's default
 server, plus - for root only - every other user's socket under

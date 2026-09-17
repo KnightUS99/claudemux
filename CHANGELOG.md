@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.0
+
+- Sessions are now named `claude-<server>-<user>-<directory>`. Two machines
+  both running claude in `/root` no longer both report `claude-root-root` to
+  Remote Control, where the names from every server appear side by side.
+- The server name comes from `$CLAUDEMUX_SERVER`, then
+  `~/.config/claudemux/server`, then `/etc/claudemux/server`, and finally the
+  short hostname - so it keeps working with no configuration at all, and
+  renaming the host does not silently rename every session.
+- The installer asks for the server name, offering the hostname as the
+  default, and writes it to `/etc/claudemux/server` when run as root so every
+  account on the box agrees. It does not ask when `$CLAUDEMUX_SERVER` is set,
+  when a name is already configured, or when there is no terminal to ask on.
+- The browser leaves the `claude-<server>-` prefix out of the session column,
+  where it is the same on every row, and names the server once in the header
+  instead. `claudemux -l` still prints the full name.
+- Sessions started by 1.2 and earlier still reattach: `claudemux`, `-a` and
+  `-k` fall back to the `claude-<user>-<directory>` and `claude-<directory>`
+  schemes before giving up.
+
 ## 1.2.3
 
 - Errors raised while the browser is on screen are no longer swallowed. Running

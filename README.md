@@ -2,22 +2,28 @@
 
 Named, reattachable [tmux](https://github.com/tmux/tmux) sessions for [Claude Code](https://claude.com/claude-code).
 
-Sessions are named `claude-<user>-<directory>`, so coming back to a project and re-running
-the command reattaches instead of starting over. Run it with no arguments and you get a
-session browser; run it as root and the browser shows every user's sessions on the box.
+Sessions are named `claude-<server>-<user>-<directory>`, so coming back to a project and
+re-running the command reattaches instead of starting over - and a session from one
+machine is still telling apart from another's when they sit side by side in Remote
+Control. Run it with no arguments and you get a session browser; run it as root and the
+browser shows every user's sessions on the box.
 
 One file, standard library only, no runtime dependencies beyond `tmux` and `python3`.
 
 ```
- claudemux 1.2.0   root@vmi3465112   [all users]                       4 sessions
-  SESSION                      OWNER       W STATE     UPTIME   IDLE    DIRECTORY
-> claude-root-api              root        1 attached  2h14m    3s      ~
-  claude-root-configs          root        1 detached  17s      17s     /etc
-  claude-jaime-website         jaime       2 detached  16s      16s     /home/jaime
-  claude-ztasks-v2-elcielo-dev ztasks      1 detached  2m32s    45s     ~/public_html
+ claudemux 1.3.0   root@contabo   [all users]                          4 sessions
+  SESSION             OWNER       W STATE     UPTIME   IDLE    DIRECTORY
+> root-api            root        1 attached  2h14m    3s      ~
+  root-configs        root        1 detached  17s      17s     /etc
+  jaime-website       jaime       2 detached  16s      16s     /home/jaime
+  ztasks-v2-elcielo-dev ztasks    1 detached  2m32s    45s     ~/public_html
 
   ENTER attach  n new  x kill  r rename  d details  / filter  ? help  q quit
 ```
+
+Every row here is on the same machine, so the browser names the server once in the
+header and leaves the `claude-<server>-` prefix off each row. `claudemux -l` prints the
+full name, and so does the details pane.
 
 Attached sessions are green, other users' are marked in yellow, and the bars are
 colour-blocked; on a terminal without colour it falls back to bold, reverse and dim.
@@ -34,11 +40,38 @@ As root that installs to `/usr/local/bin` for every account on the machine; as a
 it goes to `~/.local/bin`. Override with `INSTALL_DIR=/somewhere`. Claude Code itself is
 per-account — each user needs their own `claude` on `$PATH` (or `CLAUDE_BIN` pointing at one).
 
+The installer asks what to call this server, offering the hostname as the default. It
+skips the question when `$CLAUDEMUX_SERVER` is set, when a name is already configured, or
+when there is no terminal to ask on — so an unattended install still works and simply
+takes the hostname.
+
+### Naming the server
+
+The `<server>` part of a session name is resolved in this order:
+
+| source | for |
+| --- | --- |
+| `$CLAUDEMUX_SERVER` | one-off overrides, and unattended installs |
+| `~/.config/claudemux/server` | a per-user name, written by a non-root install |
+| `/etc/claudemux/server` | the whole box, written by a root install |
+| the short hostname | the fallback, so it works unconfigured |
+
+It is read from a file rather than taken from the hostname every time, so renaming the
+host does not silently rename every session. Change it by editing the file:
+
+```sh
+echo contabo | sudo tee /etc/claudemux/server
+```
+
+Existing sessions keep the name they were created with; new ones pick up the change.
+Sessions created before 1.3 are still found — `claudemux`, `-a` and `-k` fall back to the
+older `claude-<user>-<directory>` and `claude-<directory>` schemes before giving up.
+
 ## Use
 
 ```sh
 claudemux                  # browse sessions, attach with ENTER
-claudemux -n api           # start or reattach claude-<you>-api
+claudemux -n api           # start or reattach claude-<server>-<you>-api
 claudemux --resume         # any claude flag passes straight through
 claudemux -l               # list          -l --json for scripting
 claudemux -a NAME          # attach        -k NAME   kill
@@ -78,16 +111,16 @@ clients are attached, the panes and their pids, and the actual `claude` command 
 
 ```
  ┌─ details ──────────────────────────────────────────────────────────────────┐
- │  Session        claude-root-api                                            │
+ │  Session        claude-contabo-root-api                                    │
  │  Owner          root (uid 0)                                               │
- │  Server         /tmp/tmux-0/default                                        │
+ │  tmux socket    /tmp/tmux-0/default                                        │
  │  Created        2026-09-15 20:50:12  (3s ago)                              │
  │  Last activity  2026-09-15 20:50:12  (idle 3s)                             │
  │  State          detached (0 clients)                                       │
  │  Directory      /root                                                      │
  │  Windows        1                                                          │
  │  Pane 1.1       node  (pid 532170)                                         │
- │  Command        claude --rc claude-root-api -n claude-root-api             │
+ │  Command        claude --rc claude-contabo-root-api -n claude-contabo-ro…  │
  └────────────────────────────────────────────────────────────────────────────┘
 ```
 

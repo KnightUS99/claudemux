@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """claudemux - named, reattachable tmux sessions for Claude Code.
 
-Sessions are named claude-<user>-<directory>, so returning to a project and
-re-running the command reattaches instead of starting over. The same name is
-given to tmux, to Claude's Remote Control (--rc) and to its session display
-name, so a session is recognisable from wherever you look at it.
+Sessions are named claude-<server>-<user>-<directory>, so returning to a
+project and re-running the command reattaches instead of starting over. The
+same name is given to tmux, to Claude's Remote Control (--rc) and to its
+session display name, so a session is recognisable from wherever you look at
+it - including from another machine, which is what <server> is for.
 
 Run with no arguments for an interactive session browser. Run as root and the
 browser shows every user's sessions, not just your own.
@@ -28,10 +29,11 @@ import sys
 import threading
 import time
 import urllib.request
+from functools import lru_cache
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.2.3"
+__version__ = "1.3.0"
 
 REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
 VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
@@ -40,6 +42,9 @@ SCRIPT_URL = "https://raw.githubusercontent.com/%s/%%s/claudemux.py" % REPO
 UPDATE_CHECK_INTERVAL = 24 * 3600
 
 PREFIX = "claude"
+SERVER_ENV = "CLAUDEMUX_SERVER"
+# Checked in order; the first non-empty one wins, then the short hostname.
+SERVER_FILES = ("~/.config/claudemux/server", "/etc/claudemux/server")
 MARK = "v"  # see field(): keeps an empty value from vanishing when we split
 HISTORY_LIMIT = 50000
 QUICK_EXIT_SECONDS = 5  # below this, hold the pane open even on a clean exit
@@ -102,13 +107,82 @@ def username(uid: int) -> str:
         return "uid:%d" % uid
 
 
+@lru_cache(maxsize=1)
+def server_name() -> str:
+    """The machine label every session name on this box carries.
+
+    Two servers that both run claude in /root would otherwise both report
+    claude-root-root to Remote Control. The installer writes one of the
+    SERVER_FILES; the hostname is only the fallback, so renaming the host
+    does not silently rename every session.
+    """
+    value = os.environ.get(SERVER_ENV) or ""
+    if not value:
+        for path in SERVER_FILES:
+            try:
+                with open(os.path.expanduser(path)) as handle:
+                    value = handle.read().strip()
+            except OSError:
+                continue
+            if value:
+                break
+    if not value:
+        value = os.uname().nodename.split(".")[0]   # the fqdn crowds out the rest
+    return sanitize(value) if value else "server"
+
+
 def full_name(name: str, user: Optional[str] = None) -> str:
-    """claude-<user>-<name>, unless the caller already passed a full name."""
+    """claude-<server>-<user>-<name>, unless the caller passed a full name."""
     if name.startswith(PREFIX + "-"):
         return sanitize(name)
     if user is None:
         user = username(os.getuid())
-    return "%s-%s-%s" % (PREFIX, sanitize(user), sanitize(name))
+    return "%s-%s-%s-%s" % (PREFIX, server_name(), sanitize(user), sanitize(name))
+
+
+def legacy_names(name: str, user: Optional[str] = None) -> List[str]:
+    """What this session would have been called before, newest scheme first.
+
+    Reattaching matters more than consistency: a session started by an older
+    claudemux is still the session you want back.
+    """
+    if name.startswith(PREFIX + "-"):
+        return []
+    if user is None:
+        user = username(os.getuid())
+    return [
+        "%s-%s-%s" % (PREFIX, sanitize(user), sanitize(name)),   # 1.0 - 1.2
+        sanitize("%s-%s" % (PREFIX, name)),                      # pre-1.0
+    ]
+
+
+def base_name(name: str, user: str) -> str:
+    """The editable tail of a session name - what -n was given to build it.
+
+    Rename feeds this straight back to full_name(), so stripping the whole
+    prefix matters: leaving the user on the front would make renaming append
+    it a second time. Older schemes are stripped too, which upgrades a session
+    to the current naming rather than freezing it in the one it was born in.
+    """
+    user = sanitize(user)
+    for prefix in ("%s-%s-%s-" % (PREFIX, server_name(), user),   # current
+                   "%s-%s-" % (PREFIX, user),                     # 1.0 - 1.2
+                   "%s-" % PREFIX):                               # pre-1.0
+        if name.startswith(prefix) and len(name) > len(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def short_name(name: str) -> str:
+    """Drop the claude-<server>- prefix that every local session shares.
+
+    For display only: it is identical on every row here, so it costs width
+    and tells the reader nothing the header does not already say.
+    """
+    prefix = "%s-%s-" % (PREFIX, server_name())
+    if name.startswith(prefix) and len(name) > len(prefix):
+        return name[len(prefix):]
+    return name
 
 
 def human_duration(seconds: int) -> str:
@@ -588,15 +662,17 @@ def attach(session: Session) -> "NoReturn":  # type: ignore[valid-type]
 
 def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: bool) -> int:
     cwd = os.getcwd()
-    session_name = full_name(name or os.path.basename(cwd) or "root")
+    base = name or os.path.basename(cwd) or "root"
+    session_name = full_name(base)
 
     existing = find_session(session_name)
     if existing is None:
-        # A session from the older claude-<dir> naming is still worth reusing.
-        legacy = sanitize("%s-%s" % (PREFIX, name or os.path.basename(cwd)))
-        found = find_session(legacy)
-        if found is not None:
-            existing, session_name = found, legacy
+        # A session from an older naming scheme is still worth reusing.
+        for older in legacy_names(base):
+            found = find_session(older)
+            if found is not None:
+                existing, session_name = found, older
+                break
 
     if existing is None:
         create_session(session_name, cwd, extra, want_rc)
@@ -649,7 +725,7 @@ def session_details(session: Session) -> List[Tuple[str, str]]:
     rows = [
         ("Session", session.name),
         ("Owner", "%s (uid %d)%s" % (session.owner, session.uid, "" if session.mine else "  [other user]")),
-        ("Server", session.socket or "%s/tmux-%d/default" % (tmux_tmpdir(), session.uid)),
+        ("tmux socket", session.socket or "%s/tmux-%d/default" % (tmux_tmpdir(), session.uid)),
         ("Created", "%s  (%s ago)" % (created, human_duration(session.uptime))),
         ("Last activity", "%s  (idle %s)" % (active, human_duration(session.idle))),
         ("State", "%s (%d client%s)" % (session.state, session.attached, "" if session.attached == 1 else "s")),
@@ -827,9 +903,9 @@ class Browser:
             return
 
         scope = "all users" if self.all_users and os.getuid() == 0 else "mine"
-        host = os.uname().nodename.split(".")[0]   # the fqdn crowds out the rest
+        # The server is named once here; short_name() keeps it out of every row.
         left = " claudemux %s   %s@%s   [%s]" % (
-            __version__, username(os.getuid()), host, scope,
+            __version__, username(os.getuid()), server_name(), scope,
         )
         # Richest right-hand side that still fits; a truncated "press u" helps
         # nobody, so drop detail rather than let it run off the edge.
@@ -853,7 +929,7 @@ class Browser:
         # the directory column takes what is left - or goes away on a narrow
         # terminal rather than truncating every name.
         fixed = 2 + (11 if show_owner else 0) + 3 + 10 + 9 + 8
-        longest = max([len(s.name) for s in rows] + [len("SESSION")])
+        longest = max([len(short_name(s.name)) for s in rows] + [len("SESSION")])
         room = max(10, width - fixed)
         name_width = min(longest, room)
         path_width = room - name_width
@@ -882,7 +958,7 @@ class Browser:
             theme = self.theme
 
             segments = [("%s %-*s " % (">" if selected else " ", name_width,
-                                       session.name[:name_width]), theme.name)]
+                                       short_name(session.name)[:name_width]), theme.name)]
             if show_owner:
                 segments.append(("%-10s " % session.owner[:10],
                                  theme.name if session.mine else theme.owner_other))
@@ -973,24 +1049,25 @@ class Browser:
         if session is None:
             return
         owner = "" if session.mine else " (owned by %s)" % session.owner
-        if not self.confirm("kill %s%s?" % (session.name, owner)):
+        if not self.confirm("kill %s%s?" % (short_name(session.name), owner)):
             self.message = "not killed"
             return
         code, out = tmux_run(session.socket, "kill-session", "-t", "=" + session.name)
-        self.message = "killed %s" % session.name if code == 0 else "could not kill: %s" % out
+        self.message = "killed %s" % short_name(session.name) if code == 0 else "could not kill: %s" % out
         self.load()
 
     def do_rename(self) -> None:
         session = self.selected
         if session is None:
             return
-        new = self.ask("rename to: ", session.name)
-        if not new or new == session.name:
+        current = base_name(session.name, session.owner)
+        new = self.ask("rename to: ", current)
+        if not new or new == current:
             self.message = "rename cancelled"
             return
         target = full_name(new, session.owner)
         code, out = tmux_run(session.socket, "rename-session", "-t", "=" + session.name, target)
-        self.message = "renamed to %s" % target if code == 0 else "could not rename: %s" % out
+        self.message = "renamed to %s" % short_name(target) if code == 0 else "could not rename: %s" % out
         self.load()
 
     def do_new(self) -> None:
@@ -1104,7 +1181,9 @@ Usage: claudemux                         interactive session browser
        claudemux -l | -a NAME | -k NAME
 
 Named, reattachable tmux sessions for Claude Code, with Remote Control (--rc)
-enabled by default. Sessions are named claude-<user>-<directory>.
+enabled by default. Sessions are named claude-<server>-<user>-<directory>;
+<server> comes from $CLAUDEMUX_SERVER, else ~/.config/claudemux/server or
+/etc/claudemux/server, else this machine's short hostname.
 
   -n, --name NAME   session name (default: the current directory)
       --detach      create the session but do not attach
@@ -1124,7 +1203,7 @@ claudemux flag, e.g. claudemux -- -n "display name".
 
 Examples:
   claudemux                     browse and attach
-  claudemux -n review           start/reattach "claude-<user>-review"
+  claudemux -n review           start/reattach "claude-<server>-<user>-review"
   claudemux --resume            pick a past conversation to resume
   claudemux -l --all            every user's sessions (as root)
 """
@@ -1161,12 +1240,11 @@ def cmd_list(all_users: bool, as_json: bool) -> int:
 
 
 def resolve(name: str, all_users: bool) -> Session:
-    session = find_session(name, all_users=all_users)
-    if session is None:
-        session = find_session(full_name(name), all_users=all_users)
-    if session is None:
-        die("no such session: %s  (try: claudemux -l)" % name)
-    return session
+    for candidate in [name, full_name(name)] + legacy_names(name):
+        session = find_session(candidate, all_users=all_users)
+        if session is not None:
+            return session
+    die("no such session: %s  (try: claudemux -l)" % name)
 
 
 def cmd_kill(name: str, all_users: bool) -> int:

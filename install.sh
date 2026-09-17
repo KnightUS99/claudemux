@@ -79,10 +79,48 @@ chmod 755 "$tmpfile"
 mv "$tmpfile" "$target"
 trap - EXIT INT TERM
 
+# --- server name ------------------------------------------------------------
+# Sessions are claude-<server>-<user>-<directory>. Without a server segment two
+# boxes both running claude in /root both report claude-root-root to Remote
+# Control, and there is no way to tell which machine you are looking at.
+if [ "$(id -u)" = 0 ]; then
+    config_file=/etc/claudemux/server      # every account on the box agrees
+else
+    config_file=$HOME/.config/claudemux/server
+fi
+default_server=$(uname -n | cut -d. -f1)
+[ -n "$default_server" ] || default_server=server
+
+if [ -n "${CLAUDEMUX_SERVER:-}" ]; then
+    server=$CLAUDEMUX_SERVER
+elif [ -s "$config_file" ]; then
+    server=$(cat "$config_file")           # a reinstall keeps the existing name
+elif { true >/dev/tty; } 2>/dev/null; then
+    # Read the terminal directly: under `curl ... | sh` stdin is the script.
+    printf 'Name for this server (appears in every session name) [%s]: ' \
+        "$default_server" >/dev/tty
+    read -r server </dev/tty || server=""
+    [ -n "$server" ] || server=$default_server
+else
+    server=$default_server                 # CI, or no terminal to ask on
+fi
+# tmux session names allow a narrow set; match sanitize() in claudemux.py.
+server=$(printf '%s' "$server" | tr -c 'A-Za-z0-9_-' '-' | sed 's/^-*//; s/-*$//')
+[ -n "$server" ] || server=$default_server
+
+if mkdir -p "$(dirname "$config_file")" 2>/dev/null &&
+   printf '%s\n' "$server" > "$config_file" 2>/dev/null; then
+    chmod 644 "$config_file" 2>/dev/null || true
+else
+    warn "could not write $config_file - set CLAUDEMUX_SERVER=$server in your
+    environment instead, or sessions will be named after the hostname."
+fi
+
 # --- report -----------------------------------------------------------------
 if version=$("$target" --version 2>/dev/null); then
     note ""
     note "Installed $version -> $target"
+    note "Server name: $server   (sessions are claude-$server-$(id -un)-<directory>)"
 else
     warn "installed to $target but it would not run. If $target_dir is on a
     noexec mount, reinstall with INSTALL_DIR pointing somewhere executable."
@@ -101,7 +139,7 @@ if [ -n "$tmux_command" ]; then
     note ""
 else
     note "  claudemux            browse your sessions"
-    note "  claudemux -n api     start or reattach claude-$(id -un)-api"
+    note "  claudemux -n api     start or reattach claude-$server-$(id -un)-api"
     note "  claudemux --help     everything else"
     note ""
 fi

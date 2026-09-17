@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import shutil
 import tempfile
 import sys
 import time
@@ -11,6 +12,36 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import claudemux  # noqa: E402
+
+
+@contextlib.contextmanager
+def mock_env(**overrides):
+    """Set or (with None) unset environment variables for the duration."""
+    saved = {key: os.environ.get(key) for key in overrides}
+    for key, value in overrides.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextlib.contextmanager
+def pinned_server(name):
+    """server_name() is cached, so the cache has to go with the environment."""
+    claudemux.server_name.cache_clear()
+    try:
+        with mock_env(CLAUDEMUX_SERVER=name):
+            yield
+    finally:
+        claudemux.server_name.cache_clear()
 
 
 class TestNames(unittest.TestCase):
@@ -23,16 +54,163 @@ class TestNames(unittest.TestCase):
         self.assertEqual(claudemux.sanitize("..."), "session")
         self.assertEqual(claudemux.sanitize("---"), "session")
 
-    def test_full_name_includes_the_owner(self):
-        self.assertEqual(claudemux.full_name("site", user="jaime"), "claude-jaime-site")
+    def test_full_name_includes_the_server_and_the_owner(self):
+        with pinned_server("box1"):
+            self.assertEqual(
+                claudemux.full_name("site", user="jaime"), "claude-box1-jaime-site"
+            )
 
     def test_full_name_leaves_an_already_qualified_name_alone(self):
+        with pinned_server("box1"):
+            self.assertEqual(
+                claudemux.full_name("claude-jaime-site", user="root"), "claude-jaime-site"
+            )
+
+    def test_full_name_sanitizes_every_part(self):
+        with pinned_server("web.01"):
+            self.assertEqual(
+                claudemux.full_name("my.app", user="od.d"), "claude-web-01-od-d-my-app"
+            )
+
+    def test_the_same_directory_on_two_servers_gets_two_names(self):
+        with pinned_server("alpha"):
+            first = claudemux.full_name("root", user="root")
+        with pinned_server("beta"):
+            second = claudemux.full_name("root", user="root")
+        self.assertNotEqual(first, second)
+
+
+class TestServerName(unittest.TestCase):
+    """Resolution order: $CLAUDEMUX_SERVER, the config files, then the hostname."""
+
+    def setUp(self):
+        claudemux.server_name.cache_clear()
+        self.addCleanup(claudemux.server_name.cache_clear)
+        self._files = claudemux.SERVER_FILES
+        self.addCleanup(lambda: setattr(claudemux, "SERVER_FILES", self._files))
+
+    def use_files(self, *contents):
+        """Point SERVER_FILES at temporary files; None means the file is absent."""
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        paths = []
+        for index, text in enumerate(contents):
+            path = os.path.join(directory, "server%d" % index)
+            if text is not None:
+                with open(path, "w") as handle:
+                    handle.write(text)
+            paths.append(path)
+        claudemux.SERVER_FILES = tuple(paths)
+
+    def test_the_environment_wins(self):
+        self.use_files("fromfile\n")
+        with mock_env(CLAUDEMUX_SERVER="fromenv"):
+            self.assertEqual(claudemux.server_name(), "fromenv")
+
+    def test_the_first_readable_file_wins(self):
+        self.use_files(None, "  second  \n")
+        with mock_env(CLAUDEMUX_SERVER=None):
+            self.assertEqual(claudemux.server_name(), "second")
+
+    def test_a_user_file_shadows_the_system_one(self):
+        self.use_files("mine\n", "system\n")
+        with mock_env(CLAUDEMUX_SERVER=None):
+            self.assertEqual(claudemux.server_name(), "mine")
+
+    def test_an_empty_file_falls_through(self):
+        self.use_files("\n", "system\n")
+        with mock_env(CLAUDEMUX_SERVER=None):
+            self.assertEqual(claudemux.server_name(), "system")
+
+    def test_falls_back_to_the_short_hostname(self):
+        self.use_files(None, None)
+        with mock_env(CLAUDEMUX_SERVER=None):
+            self.assertEqual(
+                claudemux.server_name(),
+                claudemux.sanitize(os.uname().nodename.split(".")[0]),
+            )
+
+    def test_the_result_is_sanitized(self):
+        self.use_files(None, None)
+        with mock_env(CLAUDEMUX_SERVER="srv.example.com"):
+            self.assertEqual(claudemux.server_name(), "srv-example-com")
+
+
+class TestLegacyNames(unittest.TestCase):
+    """Renaming the scheme must not strand sessions an older build started."""
+
+    def test_both_older_schemes_are_offered_newest_first(self):
         self.assertEqual(
-            claudemux.full_name("claude-jaime-site", user="root"), "claude-jaime-site"
+            claudemux.legacy_names("api", user="jaime"),
+            ["claude-jaime-api", "claude-api"],
         )
 
-    def test_full_name_sanitizes_both_halves(self):
-        self.assertEqual(claudemux.full_name("my.app", user="od.d"), "claude-od-d-my-app")
+    def test_an_already_qualified_name_has_no_older_form(self):
+        self.assertEqual(claudemux.legacy_names("claude-jaime-api", user="jaime"), [])
+
+    def test_the_new_name_is_not_among_them(self):
+        with pinned_server("box1"):
+            new = claudemux.full_name("api", user="jaime")
+        self.assertNotIn(new, claudemux.legacy_names("api", user="jaime"))
+
+
+class TestBaseName(unittest.TestCase):
+    """What rename prefills, and hands straight back to full_name()."""
+
+    def test_the_whole_current_prefix_comes_off(self):
+        with pinned_server("box1"):
+            self.assertEqual(claudemux.base_name("claude-box1-root-api", "root"), "api")
+
+    def test_renaming_does_not_double_the_user(self):
+        """The bug this exists to prevent: prefill -> full_name -> same name."""
+        with pinned_server("box1"):
+            name = claudemux.full_name("api", user="root")
+            self.assertEqual(
+                claudemux.full_name(claudemux.base_name(name, "root"), user="root"), name
+            )
+
+    def test_an_older_scheme_is_upgraded_rather_than_kept(self):
+        with pinned_server("box1"):
+            self.assertEqual(claudemux.base_name("claude-root-api", "root"), "api")
+            self.assertEqual(claudemux.base_name("claude-api", "root"), "api")
+
+    def test_a_server_that_matches_the_user_is_not_confusing(self):
+        with pinned_server("root"):
+            self.assertEqual(claudemux.base_name("claude-root-root-api", "root"), "api")
+
+    def test_another_users_session_uses_that_users_prefix(self):
+        with pinned_server("box1"):
+            self.assertEqual(
+                claudemux.base_name("claude-box1-jaime-site", "jaime"), "site"
+            )
+
+    def test_an_unrecognised_name_is_left_whole(self):
+        with pinned_server("box1"):
+            self.assertEqual(claudemux.base_name("something-else", "root"), "something-else")
+
+
+class TestShortName(unittest.TestCase):
+    """The browser drops the prefix every local row shares."""
+
+    def test_the_local_prefix_is_dropped(self):
+        with pinned_server("box1"):
+            self.assertEqual(claudemux.short_name("claude-box1-root-api"), "root-api")
+
+    def test_another_servers_name_is_left_whole(self):
+        with pinned_server("box1"):
+            self.assertEqual(
+                claudemux.short_name("claude-box2-root-api"), "claude-box2-root-api"
+            )
+
+    def test_a_name_that_is_only_the_prefix_is_kept(self):
+        with pinned_server("box1"):
+            self.assertEqual(claudemux.short_name("claude-box1-"), "claude-box1-")
+
+    def test_it_is_the_inverse_of_full_name(self):
+        with pinned_server("box1"):
+            self.assertEqual(
+                claudemux.short_name(claudemux.full_name("api", user="root")), "root-api"
+            )
 
 
 class TestFormatting(unittest.TestCase):
@@ -278,7 +456,7 @@ class TestCli(unittest.TestCase):
 
     def test_usage_documents_the_passthrough(self):
         self.assertIn("--resume", claudemux.USAGE)
-        self.assertIn("claude-<user>-<directory>", claudemux.USAGE)
+        self.assertIn("claude-<server>-<user>-<directory>", claudemux.USAGE)
 
     def test_missing_argument_is_an_error(self):
         with self.quiet(), self.assertRaises(SystemExit):
