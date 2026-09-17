@@ -33,10 +33,26 @@ jobs:
         run: |
           printf '#!/bin/sh\nsleep 60\n' > /tmp/fake-claude && chmod +x /tmp/fake-claude
           export CLAUDE_BIN=/tmp/fake-claude
+          # Pinned, or the name would depend on whatever the runner is called.
+          export CLAUDEMUX_SERVER=citest
           python claudemux.py --detach -n ci
-          python claudemux.py -l | grep -q "claude-$(id -un)-ci"
-          python claudemux.py -l --json | python -c 'import json,sys; assert json.load(sys.stdin)[0]["name"].endswith("-ci")'
+          python claudemux.py -l | grep -q "claude-citest-$(id -un)-ci"
+          python claudemux.py -l --json |
+            CLAUDEMUX_EXPECT="claude-citest-$(id -un)-ci" python -c \
+              'import json,os,sys; assert json.load(sys.stdin)[0]["name"] == os.environ["CLAUDEMUX_EXPECT"]'
           python claudemux.py -k ci
+
+      - name: end-to-end (a session from an older scheme still reattaches)
+        run: |
+          printf '#!/bin/sh\nsleep 60\n' > /tmp/fake-claude && chmod +x /tmp/fake-claude
+          export CLAUDE_BIN=/tmp/fake-claude
+          export CLAUDEMUX_SERVER=citest
+          # Named the way 1.2 would have named it, by hand.
+          tmux new-session -d -s "claude-$(id -un)-old" "sleep 60"
+          python claudemux.py --detach -n old |
+            grep -q "Reattaching to existing session: claude-$(id -un)-old"
+          python claudemux.py -k old          # resolve() must find it too
+          ! tmux has-session -t "=claude-$(id -un)-old" 2>/dev/null
 
       - name: diagnostics (only when something broke)
         if: failure()
