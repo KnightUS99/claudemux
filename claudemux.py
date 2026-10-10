@@ -33,7 +33,7 @@ from functools import lru_cache
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
 VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
@@ -48,6 +48,17 @@ SERVER_FILES = ("~/.config/claudemux/server", "/etc/claudemux/server")
 MARK = "v"  # see field(): keeps an empty value from vanishing when we split
 HISTORY_LIMIT = 50000
 QUICK_EXIT_SECONDS = 5  # below this, hold the pane open even on a clean exit
+
+# Where each session's Claude keeps its temporary files (scratchpads, edit
+# diffs, sockets). Claude Code reads CLAUDE_CODE_TMPDIR and nests claude-<uid>/
+# inside it; left unset it uses /tmp, which on some hosts is a small ramdisk or
+# loop file that a few weeks of sessions fill up.
+CLAUDE_TMPDIR_ENV = "CLAUDE_CODE_TMPDIR"
+TMPDIR_ENV = "CLAUDEMUX_TMPDIR"        # a path, or "system" to leave Claude alone
+TMP_DAYS_ENV = "CLAUDEMUX_TMP_DAYS"    # prune session folders idle this long; 0 = never
+DEFAULT_TMP_DAYS = 14
+PRUNE_UNIT_DEPTH = 3                   # claude-<uid>/<project>/<session>
+TMUX_ENV_FLAG_VERSION = (3, 2)         # new-session -e arrived in tmux 3.2
 
 # Where a claude binary might live, tried in order after $CLAUDE_BIN and $PATH.
 CLAUDE_CANDIDATES = (
@@ -217,6 +228,21 @@ def proc_cmdline(pid: int) -> str:
     return " ".join(part.decode("utf-8", "replace") for part in raw.split(b"\0") if part)
 
 
+def proc_environ(pid: int) -> dict:
+    """A process's environment; empty if it is gone or not ours to read."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as handle:
+            raw = handle.read()
+    except (OSError, ValueError):
+        return {}
+    env = {}
+    for part in raw.split(b"\0"):
+        key, sep, value = part.partition(b"=")
+        if sep:
+            env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
 # --------------------------------------------------------------------------
 # tmux plumbing
 # --------------------------------------------------------------------------
@@ -241,6 +267,18 @@ def tmux_run(socket: Optional[str], *args: str) -> Tuple[int, str]:
         die("tmux is not installed - claudemux needs it to run.\n"
             "Install it with:  %s" % tmux_install_hint())
     return proc.returncode, proc.stdout.strip()
+
+
+def parse_tmux_version(text: str) -> Tuple[int, int]:
+    """(major, minor) out of "tmux 3.2a" or "tmux next-3.4"; (0, 0) for junk."""
+    match = re.search(r"(\d+)\.(\d+)", text)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+@lru_cache(maxsize=1)
+def tmux_version() -> Tuple[int, int]:
+    code, out = tmux_run(None, "-V")
+    return parse_tmux_version(out) if code == 0 else (0, 0)
 
 
 def tmux_tmpdir() -> str:
@@ -412,9 +450,12 @@ def is_newer(candidate: str, current: str) -> bool:
     return version_tuple(candidate) > version_tuple(current)
 
 
+def cache_base() -> str:
+    return os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+
+
 def cache_file() -> str:
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(base, "claudemux", "update.json")
+    return os.path.join(cache_base(), "claudemux", "update.json")
 
 
 def read_cache() -> dict:
@@ -574,6 +615,98 @@ def cmd_update(check_only: bool = False) -> int:
 
 
 # --------------------------------------------------------------------------
+# temporary files
+# --------------------------------------------------------------------------
+
+def claude_tmpdir() -> Optional[str]:
+    """The directory a new session's Claude gets for its temporary files, or
+    None to leave Claude to its own default.
+
+    $CLAUDEMUX_TMPDIR picks the place, or "system" opts out. Otherwise a
+    CLAUDE_CODE_TMPDIR already in the caller's environment is respected, and
+    failing that the files go under the cache directory - on the home disk
+    rather than /tmp, which is the point.
+    """
+    setting = os.environ.get(TMPDIR_ENV, "").strip()
+    if setting.lower() == "system":
+        return None
+    if not setting:
+        setting = os.environ.get(CLAUDE_TMPDIR_ENV, "").strip()
+    if not setting:
+        setting = os.path.join(cache_base(), "claudemux", "tmp")
+    return os.path.abspath(os.path.expanduser(setting))
+
+
+def prepare_claude_tmpdir(path: str) -> bool:
+    """Create the directory, private to this user. False if it is unusable."""
+    try:
+        if not os.path.isdir(path):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            os.chmod(path, 0o700)   # makedirs is subject to the umask; this is not
+        return os.access(path, os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def tmp_days() -> float:
+    raw = os.environ.get(TMP_DAYS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_TMP_DAYS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_TMP_DAYS
+
+
+def prune_tmpdir(root: str, days: float) -> int:
+    """Remove session folders under root that nothing has touched in `days`.
+
+    Claude lays the directory out as claude-<uid>/<project>/<session>/ (and
+    claude-<uid>/bash-edit-diff/<id>/), so the third level is the unit: a
+    session folder goes only when every file beneath it is older than the
+    cutoff (an empty one, by its own age), and nothing deeper is ever removed
+    on its own - one fresh file keeps the whole session. The two levels above
+    go once everything in them has. Symlinks are never followed, nothing
+    outside root is touched, and any error just leaves things for next time.
+    Returns how many folders were removed.
+    """
+    if days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400
+    root = os.path.abspath(root)
+    try:
+        if os.path.islink(root) or not os.path.isdir(root):
+            return 0
+    except OSError:
+        return 0
+
+    removed = 0
+    newest: dict = {}   # directory -> newest mtime beneath it, filled bottom-up
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        latest = None
+        for name in filenames + dirnames:
+            child = os.path.join(dirpath, name)
+            value = newest.pop(child, None)   # a walked directory
+            if value is None:                 # a file, or a symlink we did not follow
+                try:
+                    value = os.lstat(child).st_mtime
+                except OSError:
+                    value = time.time()       # vanished under us: treat as live
+            latest = value if latest is None else max(latest, value)
+        if latest is None:                    # empty: judge it by its own age
+            try:
+                latest = os.lstat(dirpath).st_mtime
+            except OSError:
+                continue
+        newest[dirpath] = latest
+        depth = dirpath[len(root):].count(os.sep)
+        if 0 < depth <= PRUNE_UNIT_DEPTH and latest < cutoff:
+            shutil.rmtree(dirpath, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+# --------------------------------------------------------------------------
 # launching claude
 # --------------------------------------------------------------------------
 
@@ -622,9 +755,15 @@ def build_claude_argv(
     return [claude_bin] + prefix + list(extra)
 
 
-def pane_command(argv: Sequence[str]) -> str:
+def pane_command(argv: Sequence[str], env: Optional[dict] = None) -> str:
     """Wrap claude so a fast or failing exit leaves its output on screen."""
     inner = " ".join(shlex.quote(a) for a in argv)
+    if env:
+        # Only for a tmux too old for new-session -e; the variable then reaches
+        # claude itself but not a window opened later in the session.
+        inner = "env %s %s" % (
+            " ".join("%s=%s" % (key, shlex.quote(env[key])) for key in sorted(env)), inner,
+        )
     return (
         "t0=$(date +%s); " + inner + "; rc=$?; d=$(( $(date +%s) - t0 )); "
         'if [ "$rc" -ne 0 ] || [ "$d" -lt ' + str(QUICK_EXIT_SECONDS) + " ]; then "
@@ -633,10 +772,25 @@ def pane_command(argv: Sequence[str]) -> str:
     )
 
 
-def create_session(session: str, cwd: str, extra: Sequence[str], want_rc: bool) -> None:
+def environment_args(env: dict) -> Tuple[List[str], dict]:
+    """How to get env into a new session: (new-session flags, what is left for
+    pane_command). -e puts it in the session environment, so a window opened
+    later inherits it too; before tmux 3.2 the pane command has to carry it."""
+    if not env or tmux_version() < TMUX_ENV_FLAG_VERSION:
+        return [], dict(env)
+    flags: List[str] = []
+    for key in sorted(env):
+        flags += ["-e", "%s=%s" % (key, env[key])]
+    return flags, {}
+
+
+def create_session(
+    session: str, cwd: str, extra: Sequence[str], want_rc: bool, tmpdir: Optional[str] = None
+) -> None:
     argv = build_claude_argv(find_claude(), session, extra, want_rc)
+    flags, env = environment_args({CLAUDE_TMPDIR_ENV: tmpdir} if tmpdir else {})
     code, out = tmux_run(
-        None, "new-session", "-d", "-s", session, "-c", cwd, pane_command(argv)
+        None, "new-session", "-d", "-s", session, "-c", cwd, *flags, pane_command(argv, env)
     )
     if code != 0:
         die("could not create session: %s" % (out or "tmux failed"))
@@ -674,8 +828,15 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
                 existing, session_name = found, older
                 break
 
+    tmpdir = claude_tmpdir()
     if existing is None:
-        create_session(session_name, cwd, extra, want_rc)
+        if tmpdir and not prepare_claude_tmpdir(tmpdir):
+            sys.stderr.write(
+                "claudemux: cannot use %s for Claude's temporary files - "
+                "leaving the system default\n" % tmpdir
+            )
+            tmpdir = None
+        create_session(session_name, cwd, extra, want_rc, tmpdir)
         print(
             "Started session: %s  (in %s)%s"
             % (session_name, cwd, ", Remote Control on" if want_rc else "")
@@ -687,6 +848,9 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
         )
     else:
         print("Reattaching to existing session: %s" % session_name)
+
+    if tmpdir:
+        prune_tmpdir(tmpdir, tmp_days())
 
     pending = cached_update()
     if pending:
@@ -719,6 +883,22 @@ def claude_invocation(session: Session) -> str:
     return ""
 
 
+def session_tmpdir(session: Session) -> str:
+    """The CLAUDE_CODE_TMPDIR the session's claude runs with, or "" if unset."""
+    code, out = tmux_run(
+        session.socket, "show-environment", "-t", "=" + session.name, CLAUDE_TMPDIR_ENV
+    )
+    if code == 0 and out.startswith(CLAUDE_TMPDIR_ENV + "="):
+        return out[len(CLAUDE_TMPDIR_ENV) + 1:]
+    # Not in the session environment (an older tmux, or the caller's shell
+    # set it): ask the processes themselves.
+    for pid in [session.pane_pid] + child_pids(session.pane_pid):
+        value = proc_environ(pid).get(CLAUDE_TMPDIR_ENV)
+        if value:
+            return value
+    return ""
+
+
 def session_details(session: Session) -> List[Tuple[str, str]]:
     created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session.created))
     active = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session.activity))
@@ -731,6 +911,7 @@ def session_details(session: Session) -> List[Tuple[str, str]]:
         ("State", "%s (%d client%s)" % (session.state, session.attached, "" if session.attached == 1 else "s")),
         ("Directory", session.path),
         ("Windows", str(session.windows)),
+        ("Claude temp dir", session_tmpdir(session) or "(not set - Claude's own default)"),
     ]
 
     code, out = tmux_run(
@@ -1184,6 +1365,11 @@ Named, reattachable tmux sessions for Claude Code, with Remote Control (--rc)
 enabled by default. Sessions are named claude-<server>-<user>-<directory>;
 <server> comes from $CLAUDEMUX_SERVER, else ~/.config/claudemux/server or
 /etc/claudemux/server, else this machine's short hostname.
+
+Each session's Claude keeps its temporary files under ~/.cache/claudemux/tmp
+(CLAUDE_CODE_TMPDIR) rather than /tmp. CLAUDEMUX_TMPDIR=/path moves them,
+CLAUDEMUX_TMPDIR=system leaves Claude's own default, and folders idle for
+14 days are pruned at launch (CLAUDEMUX_TMP_DAYS=0 never prunes).
 
   -n, --name NAME   session name (default: the current directory)
       --detach      create the session but do not attach

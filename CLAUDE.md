@@ -95,6 +95,12 @@ pattern rather than shelling out mid-loop.
   and is absent from `claude --help`; it is not a typo to be corrected.
 - **Injected flags never override the caller's.** `build_claude_argv()` adds `--rc`
   and `-n` only when absent, including the `--flag=value` form.
+- **`prune_tmpdir()` walks bottom-up and never removes its root.** Claude nests
+  `claude-<uid>/<project>/<session>/` inside `CLAUDE_CODE_TMPDIR`, so the top level
+  is alive whenever any session is; staleness is judged per subtree from the newest
+  file beneath it. It must never follow a symlink or touch anything outside the root.
+- **`tmux_version()` is `lru_cache`d** like `server_name()`; tests pin it by
+  replacing the function, not by setting an environment variable.
 - **The pane wrapper is deliberate.** `pane_command()` holds a pane open when claude
   exits non-zero or in under `QUICK_EXIT_SECONDS`, so a fast failure stays readable
   instead of the session vanishing.

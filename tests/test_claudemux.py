@@ -280,6 +280,221 @@ class TestPaneCommand(unittest.TestCase):
         self.assertIn("read -r _", command)
 
 
+class TestClaudeTmpdir(unittest.TestCase):
+    """Where a new session's Claude is told to keep its temporary files."""
+
+    def setUp(self):
+        self.cache = tempfile.TemporaryDirectory()
+        self.addCleanup(self.cache.cleanup)
+
+    def resolve(self, **env):
+        base = {"XDG_CACHE_HOME": self.cache.name, "CLAUDEMUX_TMPDIR": None,
+                "CLAUDE_CODE_TMPDIR": None}
+        base.update(env)
+        with mock_env(**base):
+            return claudemux.claude_tmpdir()
+
+    def test_defaults_to_the_cache_directory_not_tmp(self):
+        self.assertEqual(
+            self.resolve(), os.path.join(self.cache.name, "claudemux", "tmp")
+        )
+
+    def test_a_tmpdir_already_in_the_environment_is_respected(self):
+        self.assertEqual(self.resolve(CLAUDE_CODE_TMPDIR="/srv/scratch"), "/srv/scratch")
+
+    def test_claudemux_tmpdir_moves_it(self):
+        self.assertEqual(
+            self.resolve(CLAUDEMUX_TMPDIR="/data/claude", CLAUDE_CODE_TMPDIR="/srv/scratch"),
+            "/data/claude",
+        )
+
+    def test_system_opts_out(self):
+        self.assertIsNone(self.resolve(CLAUDEMUX_TMPDIR="system"))
+        self.assertIsNone(self.resolve(CLAUDEMUX_TMPDIR=" SYSTEM "))
+
+    def test_a_tilde_is_expanded(self):
+        self.assertEqual(
+            self.resolve(CLAUDEMUX_TMPDIR="~/scratch"), os.path.expanduser("~/scratch")
+        )
+
+    def test_prepare_creates_it_private(self):
+        path = os.path.join(self.cache.name, "deep", "er", "tmp")
+        self.assertTrue(claudemux.prepare_claude_tmpdir(path))
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o700)
+        self.assertTrue(claudemux.prepare_claude_tmpdir(path))   # idempotent
+
+    def test_prepare_reports_an_unusable_path(self):
+        blocker = os.path.join(self.cache.name, "file")
+        with open(blocker, "w") as handle:
+            handle.write("not a directory")
+        self.assertFalse(claudemux.prepare_claude_tmpdir(os.path.join(blocker, "tmp")))
+
+    def test_prune_days_parsing(self):
+        with mock_env(CLAUDEMUX_TMP_DAYS=None):
+            self.assertEqual(claudemux.tmp_days(), claudemux.DEFAULT_TMP_DAYS)
+        with mock_env(CLAUDEMUX_TMP_DAYS="0"):
+            self.assertEqual(claudemux.tmp_days(), 0)
+        with mock_env(CLAUDEMUX_TMP_DAYS="2.5"):
+            self.assertEqual(claudemux.tmp_days(), 2.5)
+        with mock_env(CLAUDEMUX_TMP_DAYS="-3"):
+            self.assertEqual(claudemux.tmp_days(), 0)
+        with mock_env(CLAUDEMUX_TMP_DAYS="soon"):
+            self.assertEqual(claudemux.tmp_days(), claudemux.DEFAULT_TMP_DAYS)
+
+
+class TestPruneTmpdir(unittest.TestCase):
+    """Stale session folders go; anything alive, and anything outside, stays."""
+
+    DAYS = 14
+
+    def setUp(self):
+        self.base = tempfile.TemporaryDirectory()
+        self.addCleanup(self.base.cleanup)
+        self.root = os.path.join(self.base.name, "tmp")
+        # The layout Claude Code builds: claude-<uid>/<project>/<session>/
+        self.project = os.path.join(self.root, "claude-1000", "-home-me-app")
+        os.makedirs(self.project)
+
+    def make(self, *parts, age_days=0, files=("scratchpad/notes.txt",)):
+        directory = os.path.join(self.project, *parts)
+        os.makedirs(directory, exist_ok=True)
+        stamp = time.time() - age_days * 86400
+        for relative in files:
+            path = os.path.join(directory, relative)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as handle:
+                handle.write("x")
+            os.utime(path, (stamp, stamp))
+        os.utime(directory, (stamp, stamp))
+        return directory
+
+    def test_a_stale_session_goes_and_a_live_one_stays(self):
+        stale = self.make("old-session", age_days=30)
+        live = self.make("new-session", age_days=1)
+        self.assertGreaterEqual(claudemux.prune_tmpdir(self.root, self.DAYS), 1)
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(os.path.join(live, "scratchpad", "notes.txt")))
+        self.assertTrue(os.path.isdir(self.root))
+
+    def test_one_fresh_file_keeps_the_whole_folder(self):
+        session = self.make("mixed", age_days=30)
+        fresh = os.path.join(session, "fresh.txt")
+        with open(fresh, "w") as handle:
+            handle.write("y")
+        claudemux.prune_tmpdir(self.root, self.DAYS)
+        self.assertTrue(os.path.exists(session))
+        self.assertTrue(os.path.exists(os.path.join(session, "scratchpad", "notes.txt")))
+
+    def test_nothing_below_a_session_is_removed_on_its_own(self):
+        """A session with one fresh file keeps even its oldest sub-folders."""
+        session = self.make("mixed", age_days=30, files=("scratchpad/notes.txt", "edits/a/b.diff"))
+        with open(os.path.join(session, "fresh.txt"), "w") as handle:
+            handle.write("y")
+        claudemux.prune_tmpdir(self.root, self.DAYS)
+        self.assertTrue(os.path.exists(os.path.join(session, "scratchpad", "notes.txt")))
+        self.assertTrue(os.path.exists(os.path.join(session, "edits", "a", "b.diff")))
+
+    def test_the_edit_diff_store_is_pruned_the_same_way(self):
+        store = os.path.join(self.root, "claude-1000", "bash-edit-diff")
+        stale = os.path.join(store, "1111-aaaa")
+        live = os.path.join(store, "2222-bbbb")
+        for path, age in ((stale, 30), (live, 1)):
+            os.makedirs(os.path.join(path, "objects"))
+            target = os.path.join(path, "objects", "blob")
+            with open(target, "w") as handle:
+                handle.write("z")
+            stamp = time.time() - age * 86400
+            os.utime(target, (stamp, stamp))
+        claudemux.prune_tmpdir(self.root, self.DAYS)
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(live))
+
+    def test_the_parent_folders_go_once_everything_in_them_is_stale(self):
+        self.make("only-session", age_days=30)
+        claudemux.prune_tmpdir(self.root, self.DAYS)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "claude-1000")))
+        self.assertTrue(os.path.isdir(self.root))   # never the root itself
+
+    def test_an_empty_folder_is_judged_by_its_own_age(self):
+        fresh = self.make("just-started", age_days=0, files=())
+        stale = self.make("abandoned", age_days=30, files=())
+        claudemux.prune_tmpdir(self.root, self.DAYS)
+        self.assertTrue(os.path.isdir(fresh))
+        self.assertFalse(os.path.exists(stale))
+
+    def test_zero_days_never_prunes(self):
+        stale = self.make("old-session", age_days=400)
+        self.assertEqual(claudemux.prune_tmpdir(self.root, 0), 0)
+        self.assertTrue(os.path.exists(stale))
+
+    def test_symlinks_are_not_followed_out_of_the_directory(self):
+        outside = os.path.join(self.base.name, "elsewhere")
+        os.makedirs(outside)
+        precious = os.path.join(outside, "keep.txt")
+        with open(precious, "w") as handle:
+            handle.write("keep")
+        old = time.time() - 60 * 86400
+        os.utime(precious, (old, old))
+        os.utime(outside, (old, old))
+        session = self.make("linked", age_days=30, files=())
+        link = os.path.join(session, "link")
+        os.symlink(outside, link)
+        os.utime(link, (old, old), follow_symlinks=False)
+        os.utime(session, (old, old))
+        claudemux.prune_tmpdir(self.root, self.DAYS)
+        self.assertFalse(os.path.exists(session))      # the stale folder went
+        self.assertTrue(os.path.exists(precious))      # the target did not
+
+    def test_a_missing_or_symlinked_root_is_left_alone(self):
+        self.assertEqual(claudemux.prune_tmpdir(os.path.join(self.base.name, "nope"), 1), 0)
+        link = os.path.join(self.base.name, "link")
+        os.symlink(self.root, link)
+        self.make("old-session", age_days=30)
+        self.assertEqual(claudemux.prune_tmpdir(link, self.DAYS), 0)
+
+
+class TestSessionEnvironment(unittest.TestCase):
+    """CLAUDE_CODE_TMPDIR reaches the session by -e, or by the pane command."""
+
+    def pin_tmux(self, version):
+        original = claudemux.tmux_version
+        claudemux.tmux_version = lambda: version
+        self.addCleanup(setattr, claudemux, "tmux_version", original)
+
+    def test_version_parsing(self):
+        self.assertEqual(claudemux.parse_tmux_version("tmux 3.2a"), (3, 2))
+        self.assertEqual(claudemux.parse_tmux_version("tmux next-3.4"), (3, 4))
+        self.assertEqual(claudemux.parse_tmux_version("tmux 2.9"), (2, 9))
+        self.assertEqual(claudemux.parse_tmux_version("tmux master"), (0, 0))
+
+    def test_a_recent_tmux_gets_dash_e(self):
+        self.pin_tmux((3, 2))
+        flags, left = claudemux.environment_args({"CLAUDE_CODE_TMPDIR": "/x/y"})
+        self.assertEqual(flags, ["-e", "CLAUDE_CODE_TMPDIR=/x/y"])
+        self.assertEqual(left, {})
+
+    def test_an_old_tmux_carries_it_in_the_pane_command(self):
+        self.pin_tmux((3, 1))
+        flags, left = claudemux.environment_args({"CLAUDE_CODE_TMPDIR": "/x/y"})
+        self.assertEqual(flags, [])
+        command = claudemux.pane_command(["/bin/claude"], left)
+        self.assertIn("env CLAUDE_CODE_TMPDIR=/x/y /bin/claude", command)
+
+    def test_nothing_to_set_means_nothing_added(self):
+        self.pin_tmux((3, 2))
+        self.assertEqual(claudemux.environment_args({}), ([], {}))
+        self.assertNotIn("env ", claudemux.pane_command(["/bin/claude"], {}))
+
+    def test_pane_command_quotes_the_value(self):
+        command = claudemux.pane_command(["/bin/claude"], {"CLAUDE_CODE_TMPDIR": "/a b/c"})
+        self.assertIn("CLAUDE_CODE_TMPDIR='/a b/c'", command)
+
+    def test_proc_environ_reads_our_own(self):
+        self.assertIn("PATH", claudemux.proc_environ(os.getpid()))
+        self.assertEqual(claudemux.proc_environ(2 ** 22 + 12345), {})
+
+
 class TestSessionParsing(unittest.TestCase):
     def line(self, *fields):
         """Build a line the way tmux -F would, escaping spaces as #{q:} does."""

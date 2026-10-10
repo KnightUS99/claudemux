@@ -11,7 +11,7 @@ browser shows every user's sessions on the box.
 One file, standard library only, no runtime dependencies beyond `tmux` and `python3`.
 
 ```
- claudemux 1.3.0   root@contabo   [all users]                          4 sessions
+ claudemux 1.4.0   root@contabo   [all users]                          4 sessions
   SESSION             OWNER       W STATE     UPTIME   IDLE    DIRECTORY
 > root-api            root        1 attached  2h14m    3s      ~
   root-configs        root        1 detached  17s      17s     /etc
@@ -172,6 +172,27 @@ To install a specific version instead, point the installer at that tag:
 ```sh
 CLAUDEMUX_REF=v1.1.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/KnightUS99/claudemux/main/install.sh)"
 ```
+
+## Temporary files
+
+Claude Code keeps its scratch files - per-session scratchpads, edit diffs, sockets -
+under `/tmp` by default. On a host where `/tmp` is a small ramdisk or a cPanel-style
+loop file, a few weeks of sessions fill it, and the next thing that needs a temporary
+file (MariaDB, PHP uploads) breaks. claudemux therefore hands every session a
+`CLAUDE_CODE_TMPDIR` on the home disk:
+
+| setting | effect |
+| --- | --- |
+| *(nothing)* | `~/.cache/claudemux/tmp` (under `$XDG_CACHE_HOME` if set), created `0700` |
+| `CLAUDE_CODE_TMPDIR` already in your environment | respected as is |
+| `CLAUDEMUX_TMPDIR=/some/path` | that directory instead |
+| `CLAUDEMUX_TMPDIR=system` | set nothing; Claude uses its own default |
+| `CLAUDEMUX_TMP_DAYS=30` | prune session folders idle longer than this (default 14; `0` never) |
+
+Pruning runs at launch, only inside that directory, and only removes a folder when
+every file in it is older than the cutoff. Symlinks are never followed. The details
+pane (`d` in the browser) shows the directory a running session was given. Sessions
+started before 1.4 keep running where they were; they pick this up when next started.
 
 ## Requirements
 

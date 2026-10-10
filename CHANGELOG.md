@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.0
+
+- Each session's Claude now keeps its temporary files (scratchpads, edit
+  diffs, sockets) under `~/.cache/claudemux/tmp` instead of `/tmp`, by
+  passing `CLAUDE_CODE_TMPDIR` into the session. On a host where `/tmp` is a
+  small ramdisk or loop file, a few weeks of sessions used to fill it and take
+  down whatever else needed it. A `CLAUDE_CODE_TMPDIR` already in your
+  environment is respected; `CLAUDEMUX_TMPDIR=/path` moves it, and
+  `CLAUDEMUX_TMPDIR=system` leaves Claude's own default alone.
+- Session folders in that directory that nothing has touched for 14 days are
+  pruned at launch. `CLAUDEMUX_TMP_DAYS` changes the age; `0` never prunes.
+  Nothing outside the directory is ever touched and symlinks are not followed.
+- The variable goes in with `new-session -e`, so a window opened later in the
+  session inherits it too. On a tmux older than 3.2 the pane command carries
+  it instead, and only claude itself sees it.
+- The details pane shows the session's «Claude temp dir». Sessions started
+  by an older claudemux keep running with whatever they had; it changes when
+  they are next started.
+
 ## 1.3.0
 
 - Sessions are now named `claude-<server>-<user>-<directory>`. Two machines
