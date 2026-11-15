@@ -33,7 +33,7 @@ from functools import lru_cache
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
 VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
@@ -59,6 +59,28 @@ TMP_DAYS_ENV = "CLAUDEMUX_TMP_DAYS"    # prune session folders idle this long; 0
 DEFAULT_TMP_DAYS = 14
 PRUNE_UNIT_DEPTH = 3                   # claude-<uid>/<project>/<session>
 TMUX_ENV_FLAG_VERSION = (3, 2)         # new-session -e arrived in tmux 3.2
+
+# The launch progress line. Claude can take several seconds to draw its first
+# frame, and attaching before then shows an empty pane that looks like a hang;
+# claudemux waits for the frame and says so while it does.
+PROGRESS_ENV = "CLAUDEMUX_PROGRESS"        # "off" silences the progress line
+START_WAIT_ENV = "CLAUDEMUX_START_WAIT"    # longest wait for the first frame; 0 = attach at once
+DEFAULT_START_WAIT = 20.0
+DEFAULT_STARTUP_SECONDS = 3.0              # the bar's guess until a launch has been timed
+STARTUP_BOUNDS = (0.5, 30.0)
+PROGRESS_WIDTH = 20
+POLL_SECONDS = 0.1
+
+# Scrolling. Set on claudemux's own sessions instead of asking for a tmux.conf.
+SCROLL_ENV = "CLAUDEMUX_SCROLL"            # "off" leaves tmux's mouse and keys alone
+OFF_WORDS = ("off", "0", "no", "false")
+PAGE_UP_BINDING = ("if-shell", "-F", "#{alternate_on}", "send-keys PPage", "copy-mode -eu")
+MOUSE_TOGGLE_KEY = "m"                     # prefix + m
+MOUSE_TOGGLE_DEFAULT = "select-pane -m"    # what tmux binds there out of the box
+MOUSE_TOGGLE_BINDING = (
+    "set-option", "mouse", "\\;", "display-message",
+    "mouse #{?mouse,on - the wheel scrolls,off - drag selects text in your terminal}",
+)
 
 # Where a claude binary might live, tried in order after $CLAUDE_BIN and $PATH.
 CLAUDE_CANDIDATES = (
@@ -534,7 +556,8 @@ def update_available(force: bool = False, timeout: float = 3.0) -> Optional[str]
         latest = fetch_latest_version(timeout)
         # Record the attempt either way, so an offline box retries tomorrow
         # rather than on every single launch.
-        cache = {"checked": time.time(), "latest": latest or cache.get("latest")}
+        # Updated in place: the cache also remembers how long Claude takes to start.
+        cache.update({"checked": time.time(), "latest": latest or cache.get("latest")})
         write_cache(cache)
     latest = cache.get("latest")
     return latest if latest and is_newer(latest, __version__) else None
@@ -784,6 +807,200 @@ def environment_args(env: dict) -> Tuple[List[str], dict]:
     return flags, {}
 
 
+# --------------------------------------------------------------------------
+# launch progress
+# --------------------------------------------------------------------------
+
+def setting_off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in OFF_WORDS
+
+
+def start_wait() -> float:
+    """Longest time to wait for Claude's first frame before attaching anyway."""
+    raw = os.environ.get(START_WAIT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_START_WAIT
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_START_WAIT
+
+
+def expected_startup() -> float:
+    """How long Claude took to appear on recent launches, for pacing the bar."""
+    value = read_cache().get("startup")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        value = DEFAULT_STARTUP_SECONDS
+    return min(max(float(value), STARTUP_BOUNDS[0]), STARTUP_BOUNDS[1])
+
+
+def remember_startup(seconds: float) -> None:
+    """Fold a measured startup into the cache; recent launches count for more."""
+    cache = read_cache()
+    previous = cache.get("startup")
+    if isinstance(previous, (int, float)) and not isinstance(previous, bool):
+        seconds = (float(previous) + seconds) / 2
+    cache["startup"] = round(min(max(seconds, STARTUP_BOUNDS[0]), STARTUP_BOUNDS[1]), 2)
+    write_cache(cache)
+
+
+def wait_fraction(elapsed: float, expected: float) -> float:
+    """How full the waiting part of the bar is: about 90% at the expected time,
+    then creeping, never complete - the wait ends when Claude draws, not when
+    a guess runs out."""
+    if elapsed <= 0 or expected <= 0:
+        return 0.0
+    return 1.0 - pow(10.0, -elapsed / expected)
+
+
+class Progress:
+    """A one-line progress bar on stderr, redrawn in place.
+
+    Silent unless stderr is a terminal, so pipes, CI logs and --detach scripts
+    see exactly what they always did. clear() must run before anything else is
+    printed or the terminal is handed to tmux.
+    """
+
+    def __init__(self, stream=None, enabled: Optional[bool] = None) -> None:
+        self.stream = sys.stderr if stream is None else stream
+        if enabled is None:
+            enabled = (
+                not setting_off(PROGRESS_ENV)
+                and os.environ.get("TERM", "dumb") != "dumb"
+                and hasattr(self.stream, "isatty") and self.stream.isatty()
+            )
+        self.enabled = enabled
+        encoding = (getattr(self.stream, "encoding", None) or "").lower().replace("-", "")
+        self.blocks = ("█", "░") if encoding.startswith("utf") else ("#", "-")
+        self.shown = False
+
+    def render(self, fraction: float, label: str, elapsed: Optional[float] = None) -> str:
+        fraction = min(max(fraction, 0.0), 1.0)
+        filled = int(round(fraction * PROGRESS_WIDTH))
+        text = "claudemux [%s%s] %3d%%  %s" % (
+            self.blocks[0] * filled, self.blocks[1] * (PROGRESS_WIDTH - filled),
+            int(fraction * 100), label,
+        )
+        if elapsed is not None:
+            text += "  %.1fs" % elapsed
+        return text
+
+    def update(self, fraction: float, label: str, elapsed: Optional[float] = None) -> None:
+        if not self.enabled:
+            return
+        # One column short of the edge: a line that wraps cannot be redrawn in place.
+        width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)
+        try:
+            self.stream.write("\r\x1b[K" + self.render(fraction, label, elapsed)[:width])
+            self.stream.flush()
+            self.shown = True
+        except (OSError, ValueError):
+            self.enabled = False
+
+    def clear(self) -> None:
+        if not (self.enabled and self.shown):
+            return
+        try:
+            self.stream.write("\r\x1b[K")
+            self.stream.flush()
+        except (OSError, ValueError):
+            pass
+        self.shown = False
+
+
+def pane_has_output(session: str) -> Optional[bool]:
+    """True once anything has been drawn in the session's pane, False while it
+    is still blank, None if the session cannot be read (it is gone)."""
+    code, out = tmux_run(None, "capture-pane", "-p", "-t", "=%s:" % session)
+    if code != 0:
+        return None
+    return bool(out.strip())
+
+
+def wait_for_claude(
+    session: str, progress: Progress, start: float = 0.0, end: float = 1.0,
+    timeout: Optional[float] = None, expected: Optional[float] = None,
+) -> Optional[float]:
+    """Wait until Claude has drawn something, moving the bar from start to end.
+
+    Returns the seconds it took, or None when the wait was given up: the
+    timeout passed, the session vanished, or the user pressed Ctrl-C to be
+    attached right away. Either way the caller attaches next.
+    """
+    timeout = start_wait() if timeout is None else timeout
+    expected = expected_startup() if expected is None else expected
+    began = time.time()
+    try:
+        while True:
+            elapsed = time.time() - began
+            drawn = pane_has_output(session)
+            if drawn:
+                return elapsed
+            if drawn is None or elapsed >= timeout:
+                return None
+            progress.update(
+                start + (end - start) * wait_fraction(elapsed, expected),
+                "waiting for Claude to start", elapsed,
+            )
+            time.sleep(POLL_SECONDS)
+    except KeyboardInterrupt:
+        return None
+
+
+# --------------------------------------------------------------------------
+# scrolling
+# --------------------------------------------------------------------------
+
+def scroll_setup_enabled() -> bool:
+    return not setting_off(SCROLL_ENV)
+
+
+def set_session_option(socket: Optional[str], session: str, option: str, value: str) -> bool:
+    # set-option takes a pane target on a modern tmux, where "=name" alone is
+    # not one, and a session target on an old one; try the exact form first.
+    for target in ("=%s:" % session, session):
+        code, _ = tmux_run(socket, "set-option", "-t", target, "-q", option, value)
+        if code == 0:
+            return True
+    return False
+
+
+def binding_state(socket: Optional[str], table: str, key: str) -> Optional[str]:
+    """What a key is bound to: "" when unbound, the command when bound, None
+    when tmux would not say - in which case the key is left alone."""
+    code, out = tmux_run(socket, "list-keys", "-T", table, key)
+    if code != 0:
+        return "" if "unknown key" in out else None
+    lines = [line for line in out.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    # bind-key [-r] -T <table> <key> <command...>
+    match = re.match(r"bind-key\s+(?:-r\s+)?-T\s+\S+\s+\S+\s+(.+)$", lines[0].strip())
+    return match.group(1).strip() if match else None
+
+
+def prepare_scrolling(session: Session) -> None:
+    """Make the wheel and PageUp scroll in this session without a tmux.conf.
+
+    Only ever on the caller's own tmux server, and only filling gaps: a mouse
+    setting the session already carries (prefix + m toggles it) and any key the
+    user has bound themselves are left exactly as they are.
+    """
+    if not scroll_setup_enabled() or not session.mine:
+        return
+    socket = session.socket
+    code, value = tmux_run(socket, "show-options", "-t", "=%s:" % session.name, "-v", "mouse")
+    if code == 0 and not value:          # nothing set on the session itself
+        set_session_option(socket, session.name, "mouse", "on")
+    # Lets Claude notice the terminal gaining focus; applies to clients that
+    # attach from now on, which is the one about to.
+    tmux_run(socket, "set-option", "-s", "-q", "focus-events", "on")
+    if binding_state(socket, "root", "PPage") == "":
+        tmux_run(socket, "bind-key", "-n", "PPage", *PAGE_UP_BINDING)
+    if binding_state(socket, "prefix", MOUSE_TOGGLE_KEY) in ("", MOUSE_TOGGLE_DEFAULT):
+        tmux_run(socket, "bind-key", MOUSE_TOGGLE_KEY, *MOUSE_TOGGLE_BINDING)
+
+
 def create_session(
     session: str, cwd: str, extra: Sequence[str], want_rc: bool, tmpdir: Optional[str] = None
 ) -> None:
@@ -794,11 +1011,16 @@ def create_session(
     )
     if code != 0:
         die("could not create session: %s" % (out or "tmux failed"))
-    tmux_run(None, "set-option", "-t", session, "-q", "history-limit", str(HISTORY_LIMIT))
+    set_session_option(None, session, "history-limit", str(HISTORY_LIMIT))
+    if scroll_setup_enabled():
+        # Before Claude gets as far as probing for it: with mouse off it tells
+        # the user to go and edit ~/.tmux.conf.
+        set_session_option(None, session, "mouse", "on")
 
 
 def attach(session: Session) -> "NoReturn":  # type: ignore[valid-type]
     """Hand the terminal over to tmux; this replaces the current process."""
+    prepare_scrolling(session)
     inside = bool(os.environ.get("TMUX"))
     same_server = session.socket is None
     if inside and same_server:
@@ -818,7 +1040,10 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
     cwd = os.getcwd()
     base = name or os.path.basename(cwd) or "root"
     session_name = full_name(base)
+    progress = Progress()
+    notes: List[str] = []       # printed once the progress line is out of the way
 
+    progress.update(0.05, "looking for an existing session")
     existing = find_session(session_name)
     if existing is None:
         # A session from an older naming scheme is still worth reusing.
@@ -831,30 +1056,47 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
     tmpdir = claude_tmpdir()
     if existing is None:
         if tmpdir and not prepare_claude_tmpdir(tmpdir):
-            sys.stderr.write(
+            notes.append(
                 "claudemux: cannot use %s for Claude's temporary files - "
-                "leaving the system default\n" % tmpdir
+                "leaving the system default" % tmpdir
             )
             tmpdir = None
-        create_session(session_name, cwd, extra, want_rc, tmpdir)
-        print(
+        progress.update(0.1, "starting Claude")
+        try:
+            create_session(session_name, cwd, extra, want_rc, tmpdir)
+        except SystemExit:
+            progress.clear()
+            raise
+        notes.append(
             "Started session: %s  (in %s)%s"
             % (session_name, cwd, ", Remote Control on" if want_rc else "")
         )
+        if not detach:
+            # Attaching now would show an empty pane until Claude has loaded.
+            took = wait_for_claude(session_name, progress, 0.15, 0.95)
+            if took is not None:
+                remember_startup(took)
         existing = find_session(session_name) or Session(
             name=session_name, uid=os.getuid(), socket=None, windows=1,
             attached=0, created=int(time.time()), activity=int(time.time()),
             path=cwd, command="", pane_pid=0,
         )
     else:
-        print("Reattaching to existing session: %s" % session_name)
+        progress.update(0.5, "reattaching")
+        notes.append("Reattaching to existing session: %s" % session_name)
 
     if tmpdir:
+        progress.update(0.97, "tidying temporary files")
         prune_tmpdir(tmpdir, tmp_days())
 
     pending = cached_update()
     if pending:
-        print("claudemux %s is available - update with: claudemux --update" % pending)
+        notes.append("claudemux %s is available - update with: claudemux --update" % pending)
+
+    progress.clear()
+    for note in notes:
+        (sys.stderr if note.startswith("claudemux: ") else sys.stdout).write(note + "\n")
+    sys.stdout.flush()
 
     if detach:
         print("Attach with: claudemux -a %s   (or: tmux a -t %s)" % (session_name, session_name))
@@ -1370,6 +1612,14 @@ Each session's Claude keeps its temporary files under ~/.cache/claudemux/tmp
 (CLAUDE_CODE_TMPDIR) rather than /tmp. CLAUDEMUX_TMPDIR=/path moves them,
 CLAUDEMUX_TMPDIR=system leaves Claude's own default, and folders idle for
 14 days are pruned at launch (CLAUDEMUX_TMP_DAYS=0 never prunes).
+
+A new session is attached once Claude has drawn its first frame, with a
+progress bar meanwhile (Ctrl-C attaches at once). CLAUDEMUX_PROGRESS=off hides
+the bar; CLAUDEMUX_START_WAIT=0 never waits.
+
+The mouse wheel and PageUp scroll in every session, with no tmux.conf needed,
+and prefix + m (Ctrl-b m) turns the mouse off and on again for selecting text
+with your terminal. CLAUDEMUX_SCROLL=off leaves tmux's settings untouched.
 
   -n, --name NAME   session name (default: the current directory)
       --detach      create the session but do not attach

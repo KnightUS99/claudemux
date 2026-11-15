@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.5.0
+
+- Starting a session shows a progress bar, and attaches once Claude has drawn
+  its first frame rather than straight away. Claude can take several seconds
+  to load, and until now that time was spent looking at an empty pane that was
+  easy to mistake for a hang. The bar paces itself on how long Claude took on
+  recent launches; Ctrl-C attaches at once, `CLAUDEMUX_START_WAIT` sets the
+  longest wait (20 seconds by default, `0` never waits) and
+  `CLAUDEMUX_PROGRESS=off` hides the bar. Nothing is drawn unless stderr is a
+  terminal, so scripts and `--detach` output are unchanged.
+- The mouse wheel and PageUp now scroll in every claudemux session with no
+  `tmux.conf` at all. claudemux turns the mouse on for its own sessions - the
+  session, not the whole tmux server - so Claude no longer answers a dead wheel
+  with "add 'set -g mouse on' to ~/.tmux.conf". It also turns on focus events,
+  which Claude asks for the same way, and binds PageUp to scroll back when
+  nothing is bound there. Sessions that are already running pick all of this
+  up the next time claudemux attaches to them.
+- `prefix + m` (Ctrl-b m) turns the mouse off and on again for the current
+  session, for selecting text with the terminal's own selection. It replaces
+  tmux's stock "mark pane" binding only; a key you have bound yourself is left
+  alone, and so is a session whose mouse you switched off.
+- `CLAUDEMUX_SCROLL=off` leaves every one of those tmux settings untouched.
+  Another user's tmux server is never changed, even by root.
+- The update check no longer discards the rest of the cache file when it
+  records its result.
+
 ## 1.4.0
 
 - Each session's Claude now keeps its temporary files (scratchpads, edit

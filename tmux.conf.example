@@ -1,6 +1,9 @@
 # System-wide tmux defaults. Read by every user before ~/.tmux.conf,
 # so anything here can be overridden per-account.
 
+# claudemux turns the mouse on and binds PageUp for its own sessions without
+# any of this; the lines below extend the same behaviour to every tmux session.
+
 # Scrollback: mouse wheel scrolls, click to select panes/windows.
 set -g mouse on
 set -g history-limit 50000

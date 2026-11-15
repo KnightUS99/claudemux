@@ -35,7 +35,9 @@ itself rather than with argparse, because unrecognised arguments must pass throu
 to `claude` untouched.
 
 **tmux is the only state.** Sessions are discovered by querying tmux, never tracked
-in a file. The sole persisted state is the update-check cache in `~/.cache/claudemux/`.
+in a file. The sole persisted state is the cache in `~/.cache/claudemux/update.json`:
+the update check's result and how long Claude last took to start. Both writers update
+the dictionary in place; replacing it wholesale loses the other's key.
 
 **One name, three places.** `full_name()` produces `claude-<server>-<user>-<directory>`
 and that string is given to tmux, to Claude's Remote Control (`--rc`) and to Claude's
@@ -101,6 +103,26 @@ pattern rather than shelling out mid-loop.
   file beneath it. It must never follow a symlink or touch anything outside the root.
 - **`tmux_version()` is `lru_cache`d** like `server_name()`; tests pin it by
   replacing the function, not by setting an environment variable.
+- **The progress line is stderr-only and must be cleared first.** `Progress` draws
+  only when stderr is a terminal; `launch()` collects its messages in `notes` and
+  prints them after `progress.clear()`, because anything printed over the line or
+  left on it when tmux takes the terminal is garbage on screen.
+- **`wait_for_claude()` never fails a launch.** Timeout, a vanished session and
+  Ctrl-C all return `None` and the caller attaches anyway. It must not wait under
+  `--detach`.
+- **Scroll setup fills gaps, it does not impose.** `prepare_scrolling()` sets `mouse`
+  on the session (never `-g`), only when the session has no value of its own, binds
+  keys only when they are unbound or still tmux's default, and returns early for a
+  session that is not `mine`. It runs from `attach()`, so already-running sessions
+  get it too.
+- **`set-option -t` wants `=name:` with the colon.** On a modern tmux it takes a pane
+  target, and `=name` alone is "no such session"; `set_session_option()` tries that
+  form and then the bare name for an old tmux.
+- **`\;` in `MOUSE_TOGGLE_BINDING` is an escaped separator.** A bare `;` argument
+  ends the `bind-key` command and runs the rest immediately instead of binding it.
+- **A detached session is already the right size.** tmux sizes it from the terminal
+  that ran `new-session`, so Claude's first frame survives the attach. Do not add
+  `-x`/`-y`: tmux 3.2 ignores them here, and `resize-window` pins the size for good.
 - **The pane wrapper is deliberate.** `pane_command()` holds a pane open when claude
   exits non-zero or in under `QUICK_EXIT_SECONDS`, so a fast failure stays readable
   instead of the session vanishing.

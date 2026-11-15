@@ -140,19 +140,50 @@ Sessions start with `--rc <session-name>`, an alias for `--remote-control`, so y
 the session up from claude.ai. It is accepted by the CLI but **not listed in
 `claude --help`**; `claudemux --no-rc` opts out per launch.
 
-## Scrolling
+## Starting up
 
-Coming from GNU `screen`, tmux's default scrollback is the thing worth fixing first. There
-is a [`tmux.conf.example`](tmux.conf.example) in this repo — the important part being:
+A new session is attached once Claude has drawn its first frame, and until then
+claudemux shows what it is doing:
 
-```tmux
-set -g mouse on          # wheel scrolling
-set -g history-limit 50000
-setw -g mode-keys vi
+```
+claudemux [███████████░░░░░░░░░]  58%  waiting for Claude to start  1.4s
 ```
 
-Drop it in `~/.tmux.conf`, or in `/etc/tmux.conf` to set it for every account. With mouse
-mode on, hold **Shift** while dragging for your terminal's own copy/paste.
+Claude can take several seconds to load, and attaching straight away used to mean
+looking at an empty pane. The bar paces itself on how long Claude took on your recent
+launches, so it is an estimate, not a measurement. **Ctrl-C** attaches at once.
+
+| variable | effect |
+| --- | --- |
+| `CLAUDEMUX_PROGRESS=off` | no progress bar |
+| `CLAUDEMUX_START_WAIT=SECONDS` | longest wait for the first frame (default 20; `0` attaches immediately) |
+
+## Scrolling
+
+The mouse wheel and **PageUp** scroll back in every claudemux session, with nothing to
+add to a `tmux.conf`. Each time it attaches, claudemux fills in whatever is missing:
+
+- **mouse on, for that session only** — your other tmux sessions keep their own setting.
+  With the mouse off, Claude answers a dead wheel by asking you to edit `~/.tmux.conf`;
+  this is what that message was asking for.
+- **focus events on**, which Claude asks for in the same way.
+- **PageUp** enters scrollback (and is passed through to full-screen programs), unless
+  you have bound PageUp yourself.
+- **`prefix + m`** (Ctrl-b, then m) turns the mouse off and on again, with a message
+  saying which. Off, a drag selects text with your terminal's own selection instead of
+  tmux's — or hold **Shift** while dragging, which most terminals treat the same way.
+  This takes the place of tmux's stock "mark pane" key; a binding of your own is left alone.
+
+Scrolling down to the bottom, or pressing `q`, leaves scrollback. A session whose mouse you
+switched off stays off when you reattach. `CLAUDEMUX_SCROLL=off` stops claudemux changing
+any tmux setting, and it never changes another user's tmux server, even as root.
+
+If the wheel still does nothing, the terminal is not sending wheel events at all: check
+that mouse reporting is enabled in the terminal app, and use PageUp meanwhile.
+
+The [`tmux.conf.example`](tmux.conf.example) in this repo is still worth having for the
+rest — a 50,000-line history for every pane, vi keys in scrollback, a status bar that
+names the account. Drop it in `~/.tmux.conf`, or in `/etc/tmux.conf` for every account.
 
 ## Updating
 

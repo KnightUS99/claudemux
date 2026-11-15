@@ -41,6 +41,8 @@ jobs:
           tmux show-environment -t "claude-citest-$(id -un)-ci" CLAUDE_CODE_TMPDIR |
             grep -q "^CLAUDE_CODE_TMPDIR=$HOME/.cache/claudemux/tmp$"
           test -d "$HOME/.cache/claudemux/tmp"
+          # The wheel works without a tmux.conf: mouse is on for the session.
+          test "$(tmux show-options -t "=claude-citest-$(id -un)-ci:" -v mouse)" = on
           python claudemux.py -l --json |
             CLAUDEMUX_EXPECT="claude-citest-$(id -un)-ci" python -c \
               'import json,os,sys; assert json.load(sys.stdin)[0]["name"] == os.environ["CLAUDEMUX_EXPECT"]'

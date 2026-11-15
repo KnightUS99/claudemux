@@ -495,6 +495,253 @@ class TestSessionEnvironment(unittest.TestCase):
         self.assertEqual(claudemux.proc_environ(2 ** 22 + 12345), {})
 
 
+class FakeTmux:
+    """Stands in for tmux_run: answers from a table and records every call."""
+
+    def __init__(self, answers=None):
+        self.answers = answers or {}
+        self.calls = []
+
+    def __call__(self, socket, *args):
+        self.calls.append(args)
+        for prefix, answer in self.answers.items():
+            if args[:len(prefix)] == prefix:
+                return answer(args) if callable(answer) else answer
+        return 0, ""
+
+    def ran(self, *prefix):
+        return [call for call in self.calls if call[:len(prefix)] == prefix]
+
+
+class EncodedStream(io.StringIO):
+    """A StringIO whose encoding can be chosen, like a terminal's."""
+    encoding = "utf-8"
+
+
+class TestProgress(unittest.TestCase):
+    def make(self, encoding="utf-8", enabled=True):
+        stream = EncodedStream()
+        stream.encoding = encoding
+        return claudemux.Progress(stream=stream, enabled=enabled), stream
+
+    def test_bar_is_always_the_same_width(self):
+        progress, _ = self.make()
+        for fraction in (-1, 0, 0.26, 0.5, 0.999, 1, 7):
+            bar = progress.render(fraction, "x").split("[")[1].split("]")[0]
+            self.assertEqual(len(bar), claudemux.PROGRESS_WIDTH)
+
+    def test_render_shows_percentage_label_and_elapsed(self):
+        progress, _ = self.make()
+        text = progress.render(0.5, "waiting for Claude to start", 2.34)
+        self.assertIn(" 50%", text)
+        self.assertIn("waiting for Claude to start", text)
+        self.assertTrue(text.endswith("2.3s"))
+
+    def test_falls_back_to_ascii_without_a_utf8_terminal(self):
+        progress, _ = self.make(encoding="ANSI_X3.4-1968")
+        text = progress.render(0.5, "x")
+        text.encode("ascii")   # raises if anything non-ASCII crept in
+        self.assertIn("#", text)
+
+    def test_disabled_progress_writes_nothing(self):
+        progress, stream = self.make(enabled=False)
+        progress.update(0.5, "x")
+        progress.clear()
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_not_a_terminal_means_disabled(self):
+        self.assertFalse(claudemux.Progress(stream=io.StringIO()).enabled)
+
+    def test_clear_erases_the_line_and_only_once(self):
+        progress, stream = self.make()
+        progress.update(0.5, "x")
+        progress.clear()
+        progress.clear()
+        self.assertTrue(stream.getvalue().endswith("\r\x1b[K"))
+        self.assertEqual(stream.getvalue().count("\r\x1b[K"), 2)   # one draw, one erase
+
+    def test_a_line_never_reaches_the_terminal_edge(self):
+        progress, stream = self.make()
+        original = shutil.get_terminal_size
+        shutil.get_terminal_size = lambda fallback=None: os.terminal_size((30, 24))
+        self.addCleanup(setattr, shutil, "get_terminal_size", original)
+        progress.update(0.5, "a label much longer than the terminal is wide", 1.0)
+        self.assertEqual(len(stream.getvalue()) - len("\r\x1b[K"), 29)
+
+    def test_wait_fraction_rises_but_never_completes(self):
+        values = [claudemux.wait_fraction(t, 3.0) for t in (0, 1, 3, 10, 600)]
+        self.assertEqual(values[0], 0.0)
+        self.assertEqual(values, sorted(values))
+        self.assertAlmostEqual(values[2], 0.9)
+        self.assertLessEqual(values[-1], 1.0)
+        self.assertEqual(claudemux.wait_fraction(5, 0), 0.0)
+
+    def test_start_wait_setting(self):
+        with mock_env(CLAUDEMUX_START_WAIT=None):
+            self.assertEqual(claudemux.start_wait(), claudemux.DEFAULT_START_WAIT)
+        with mock_env(CLAUDEMUX_START_WAIT="0"):
+            self.assertEqual(claudemux.start_wait(), 0.0)
+        with mock_env(CLAUDEMUX_START_WAIT="-4"):
+            self.assertEqual(claudemux.start_wait(), 0.0)
+        with mock_env(CLAUDEMUX_START_WAIT="soon"):
+            self.assertEqual(claudemux.start_wait(), claudemux.DEFAULT_START_WAIT)
+
+
+class TestWaitForClaude(unittest.TestCase):
+    def setUp(self):
+        self.progress = claudemux.Progress(stream=io.StringIO(), enabled=False)
+        for name, value in (("POLL_SECONDS", 0.0),):
+            self.addCleanup(setattr, claudemux, name, getattr(claudemux, name))
+            setattr(claudemux, name, value)
+        self.addCleanup(setattr, claudemux, "tmux_run", claudemux.tmux_run)
+
+    def test_returns_once_the_pane_has_output(self):
+        screens = iter(["", "", "", "Welcome"])
+        claudemux.tmux_run = FakeTmux({("capture-pane",): lambda args: (0, next(screens))})
+        took = claudemux.wait_for_claude("s", self.progress, timeout=30, expected=1)
+        self.assertIsNotNone(took)
+        self.assertEqual(len(claudemux.tmux_run.calls), 4)
+        self.assertEqual(claudemux.tmux_run.calls[0][-1], "=s:")
+
+    def test_gives_up_at_the_timeout(self):
+        claudemux.tmux_run = FakeTmux()   # the pane stays blank
+        self.assertIsNone(claudemux.wait_for_claude("s", self.progress, timeout=0, expected=1))
+
+    def test_stops_when_the_session_is_gone(self):
+        claudemux.tmux_run = FakeTmux({("capture-pane",): (1, "can't find session")})
+        self.assertIsNone(claudemux.wait_for_claude("s", self.progress, timeout=30, expected=1))
+        self.assertEqual(len(claudemux.tmux_run.calls), 1)
+
+    def test_ctrl_c_attaches_instead_of_aborting(self):
+        def interrupt(args):
+            raise KeyboardInterrupt
+        claudemux.tmux_run = FakeTmux({("capture-pane",): interrupt})
+        self.assertIsNone(claudemux.wait_for_claude("s", self.progress, timeout=30, expected=1))
+
+
+class TestStartupMemory(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patch = mock_env(XDG_CACHE_HOME=self.tmp)
+        patch.__enter__()
+        self.addCleanup(patch.__exit__, None, None, None)
+
+    def test_default_until_a_launch_has_been_timed(self):
+        self.assertEqual(claudemux.expected_startup(), claudemux.DEFAULT_STARTUP_SECONDS)
+
+    def test_remembers_and_averages(self):
+        claudemux.remember_startup(2.0)
+        self.assertEqual(claudemux.expected_startup(), 2.0)
+        claudemux.remember_startup(6.0)
+        self.assertEqual(claudemux.expected_startup(), 4.0)
+
+    def test_stays_within_bounds_and_survives_junk(self):
+        claudemux.remember_startup(900)
+        self.assertEqual(claudemux.expected_startup(), claudemux.STARTUP_BOUNDS[1])
+        claudemux.write_cache({"startup": "fast"})
+        self.assertEqual(claudemux.expected_startup(), claudemux.DEFAULT_STARTUP_SECONDS)
+
+    def test_update_check_and_startup_time_share_the_cache(self):
+        claudemux.write_cache({"checked": 1, "latest": "9.9.9"})
+        claudemux.remember_startup(2.0)
+        self.assertEqual(claudemux.read_cache()["latest"], "9.9.9")
+        original = claudemux.fetch_latest_version
+        claudemux.fetch_latest_version = lambda timeout=3.0, authoritative=False: "9.9.9"
+        self.addCleanup(setattr, claudemux, "fetch_latest_version", original)
+        with mock_env(CLAUDEMUX_NO_UPDATE_CHECK=None):
+            claudemux.update_available(force=True)
+        self.assertEqual(claudemux.read_cache()["startup"], 2.0)
+
+
+class TestScrolling(unittest.TestCase):
+    UNBOUND = (1, "unknown key: PPage")
+
+    def session(self, uid=None):
+        return claudemux.Session(
+            name="claude-box-me-api", uid=os.getuid() if uid is None else uid,
+            socket=None, windows=1, attached=0, created=0, activity=0,
+            path="/", command="", pane_pid=0,
+        )
+
+    def prepare(self, answers=None, session=None, **env):
+        fake = FakeTmux(answers)
+        self.addCleanup(setattr, claudemux, "tmux_run", claudemux.tmux_run)
+        claudemux.tmux_run = fake
+        env.setdefault("CLAUDEMUX_SCROLL", None)
+        with mock_env(**env):
+            claudemux.prepare_scrolling(session or self.session())
+        return fake
+
+    def test_bare_tmux_gets_mouse_focus_and_both_keys(self):
+        fake = self.prepare({
+            ("list-keys", "-T", "root"): self.UNBOUND,
+            ("list-keys", "-T", "prefix"): (0, "bind-key    -T prefix m    select-pane -m"),
+        })
+        self.assertEqual(
+            fake.ran("set-option", "-t"),
+            [("set-option", "-t", "=claude-box-me-api:", "-q", "mouse", "on")],
+        )
+        self.assertEqual(len(fake.ran("set-option", "-s", "-q", "focus-events", "on")), 1)
+        self.assertEqual(len(fake.ran("bind-key", "-n", "PPage")), 1)
+        self.assertEqual(len(fake.ran("bind-key", "m")), 1)
+
+    def test_mouse_is_set_on_the_session_never_globally(self):
+        fake = self.prepare()
+        for call in fake.ran("set-option"):
+            if "mouse" in call:
+                self.assertNotIn("-g", call)
+
+    def test_a_mouse_choice_already_on_the_session_is_kept(self):
+        for choice in ("off", "on"):
+            fake = self.prepare({("show-options",): (0, choice)})
+            self.assertEqual(fake.ran("set-option", "-t"), [])
+
+    def test_keys_the_user_bound_are_left_alone(self):
+        fake = self.prepare({
+            ("list-keys", "-T", "root"): (0, 'bind-key -T root PPage copy-mode -u'),
+            ("list-keys", "-T", "prefix"): (0, "bind-key -T prefix m new-window"),
+        })
+        self.assertEqual(fake.ran("bind-key"), [])
+
+    def test_a_key_tmux_will_not_describe_is_left_alone(self):
+        fake = self.prepare({("list-keys",): (1, "usage: list-keys [-T key-table]")})
+        self.assertEqual(fake.ran("bind-key"), [])
+
+    def test_opting_out_touches_nothing(self):
+        for word in ("off", "0", "OFF", " no "):
+            self.assertEqual(self.prepare(CLAUDEMUX_SCROLL=word).calls, [])
+
+    def test_another_users_server_is_never_changed(self):
+        self.assertEqual(self.prepare(session=self.session(uid=os.getuid() + 1)).calls, [])
+
+    def test_binding_state(self):
+        self.addCleanup(setattr, claudemux, "tmux_run", claudemux.tmux_run)
+        cases = [
+            ((0, ""), ""),
+            ((1, "unknown key: m"), ""),
+            ((1, "usage: list-keys"), None),
+            ((0, "bind-key -T prefix m select-pane -m"), "select-pane -m"),
+            ((0, "bind-key -r -T prefix m select-pane -m"), "select-pane -m"),
+            ((0, 'bind-key -T root PPage if-shell -F "#{alternate_on}" "send-keys PPage" "copy-mode -eu"'),
+             'if-shell -F "#{alternate_on}" "send-keys PPage" "copy-mode -eu"'),
+        ]
+        for answer, expected in cases:
+            claudemux.tmux_run = FakeTmux({("list-keys",): answer})
+            self.assertEqual(claudemux.binding_state(None, "prefix", "m"), expected, answer)
+
+    def test_session_option_falls_back_to_the_plain_name_on_old_tmux(self):
+        self.addCleanup(setattr, claudemux, "tmux_run", claudemux.tmux_run)
+        claudemux.tmux_run = FakeTmux({("set-option", "-t", "=s:"): (1, "no such session")})
+        self.assertTrue(claudemux.set_session_option(None, "s", "mouse", "on"))
+        self.assertEqual(claudemux.tmux_run.calls[-1], ("set-option", "-t", "s", "-q", "mouse", "on"))
+
+    def test_toggle_binding_keeps_its_command_separator_escaped(self):
+        # A bare ";" would end the bind-key command and run the rest at once.
+        self.assertIn("\;", claudemux.MOUSE_TOGGLE_BINDING)
+        self.assertNotIn(";", claudemux.MOUSE_TOGGLE_BINDING)
+
+
 class TestSessionParsing(unittest.TestCase):
     def line(self, *fields):
         """Build a line the way tmux -F would, escaping spaces as #{q:} does."""
