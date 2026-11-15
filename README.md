@@ -82,6 +82,7 @@ claudemux -a NAME          # attach        -k NAME   kill
 | `-n, --name NAME` | session name (default: the current directory) |
 | `--detach` | create the session but don't attach |
 | `--no-rc` | start without Remote Control |
+| `--skip-perms` | start claude with `--dangerously-skip-permissions`; as root also sets `IS_SANDBOX=1`, which claude requires |
 | `-l, --list` | list sessions (`--json` for machine-readable output) |
 | `-a, --attach NAME` | attach to a session |
 | `-k, --kill NAME` | kill a session |
@@ -91,6 +92,22 @@ claudemux -a NAME          # attach        -k NAME   kill
 Anything claudemux doesn't recognise goes to `claude` untouched, so `--resume`, `-c` and
 `--model opus` work directly. Use `--` for arguments that would otherwise be read as
 claudemux flags: `claudemux -- -n "display name"`.
+
+### Environment variables
+
+A session's Claude is started by the tmux server, not by your shell, so it does not see
+your shell's environment. claudemux carries these across when it creates a session:
+`IS_SANDBOX`, anything starting `ANTHROPIC_`, `CLAUDE_CONFIG_DIR`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and
+`CLAUDE_CODE_NO_FLICKER`. Add others with `CLAUDEMUX_ENV`:
+
+```sh
+IS_SANDBOX=1 claudemux --dangerously-skip-permissions    # or just: claudemux --skip-perms
+CLAUDEMUX_ENV=HTTPS_PROXY,NO_PROXY claudemux
+```
+
+They only apply to a session being created. Reattaching to one that is already running
+changes nothing about it, and claudemux says so if you passed arguments.
 
 ### The browser
 

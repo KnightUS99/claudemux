@@ -495,6 +495,100 @@ class TestSessionEnvironment(unittest.TestCase):
         self.assertEqual(claudemux.proc_environ(2 ** 22 + 12345), {})
 
 
+class TestForwardedEnvironment(unittest.TestCase):
+    def test_sandbox_flag_and_anthropic_settings_are_carried(self):
+        env = claudemux.forwarded_environment({
+            "IS_SANDBOX": "1", "ANTHROPIC_API_KEY": "k", "ANTHROPIC_BASE_URL": "u",
+            "HOME": "/root", "PATH": "/bin",
+        })
+        self.assertEqual(env, {"IS_SANDBOX": "1", "ANTHROPIC_API_KEY": "k", "ANTHROPIC_BASE_URL": "u"})
+
+    def test_a_claude_sessions_own_plumbing_is_not_carried(self):
+        env = claudemux.forwarded_environment({
+            "CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "x", "CLAUDE_CODE_ENTRYPOINT": "cli",
+            "CLAUDE_CODE_MESSAGING_TOKEN": "t", "CLAUDE_PID": "1", "CLAUDE_CODE_TMPDIR": "/t",
+        })
+        self.assertEqual(env, {})
+
+    def test_extra_names_can_be_listed(self):
+        env = claudemux.forwarded_environment({
+            "CLAUDEMUX_ENV": "HTTPS_PROXY, NO_PROXY  MISSING bad-name", "HTTPS_PROXY": "p",
+            "NO_PROXY": "n", "bad-name": "x", "OTHER": "o",
+        })
+        self.assertEqual(env, {"HTTPS_PROXY": "p", "NO_PROXY": "n"})
+
+    def test_env_file_is_private_and_quotes_values(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock_env(XDG_CACHE_HOME=tmp):
+            path = claudemux.write_env_file("claude-b-u-x", {"A": "it's $HOME; rm -rf", "B": "1"})
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
+            import subprocess
+            out = subprocess.run(
+                ["sh", "-c", '. "$1"; printf "%s|%s" "$A" "$B"', "sh", path],
+                stdout=subprocess.PIPE, universal_newlines=True,
+            ).stdout
+            self.assertEqual(out, "it's $HOME; rm -rf|1")
+            self.assertIsNone(claudemux.write_env_file("claude-b-u-x", {}))
+
+    def test_env_file_replaces_a_symlink_instead_of_following_it(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock_env(XDG_CACHE_HOME=tmp):
+            first = claudemux.write_env_file("s", {"A": "1"})
+            victim = os.path.join(tmp, "victim")
+            open(victim, "w").write("untouched")
+            os.unlink(first)
+            os.symlink(victim, first)
+            claudemux.write_env_file("s", {"A": "2"})
+            self.assertFalse(os.path.islink(first))
+            self.assertEqual(open(victim).read(), "untouched")
+
+    def test_pane_command_sources_then_removes_the_file(self):
+        command = claudemux.pane_command(["claude"], None, "/c/my env/s.env")
+        self.assertIn(". '/c/my env/s.env'; rm -f '/c/my env/s.env'", command)
+        self.assertLess(command.index("rm -f"), command.index("claude;"))
+        self.assertNotIn(".env", claudemux.pane_command(["claude"]))
+
+
+class TestSkipPerms(unittest.TestCase):
+    def test_adds_the_flag_ahead_of_the_callers_arguments(self):
+        self.assertEqual(
+            claudemux.with_skip_permissions(["--resume"], {}),
+            ["--dangerously-skip-permissions", "--resume"],
+        )
+
+    def test_does_not_repeat_a_flag_the_caller_gave(self):
+        extra = ["--resume", "--dangerously-skip-permissions"]
+        self.assertEqual(claudemux.with_skip_permissions(extra, {}), extra)
+
+    def test_root_gets_the_sandbox_marker_and_nobody_else_does(self):
+        original = os.getuid
+        self.addCleanup(setattr, os, "getuid", original)
+        os.getuid = lambda: 0
+        environ = {}
+        claudemux.with_skip_permissions([], environ)
+        self.assertEqual(environ, {"IS_SANDBOX": "1"})
+        environ = {"IS_SANDBOX": "0"}          # an explicit choice is not overridden
+        claudemux.with_skip_permissions([], environ)
+        self.assertEqual(environ, {"IS_SANDBOX": "0"})
+        os.getuid = lambda: 1000
+        environ = {}
+        claudemux.with_skip_permissions([], environ)
+        self.assertEqual(environ, {})
+
+    def test_cli_flag_reaches_launch_in_both_spellings(self):
+        seen = []
+        original = claudemux.launch
+        self.addCleanup(setattr, claudemux, "launch", original)
+        claudemux.launch = lambda name, extra, want_rc, detach: seen.append(list(extra)) or 0
+        with mock_env(IS_SANDBOX=None):
+            for spelling in ("--skip-perms", "-skip-perms"):
+                claudemux.main([spelling, "--resume"])
+        self.assertEqual(seen, [["--dangerously-skip-permissions", "--resume"]] * 2)
+
+
 class FakeTmux:
     """Stands in for tmux_run: answers from a table and records every call."""
 

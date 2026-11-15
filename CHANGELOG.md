@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.6.0
+
+- `claudemux --skip-perms` starts claude with `--dangerously-skip-permissions`.
+  As root it also sets `IS_SANDBOX=1`, which claude requires before it accepts
+  that flag from root - so the whole of
+  `IS_SANDBOX=1 claudemux --dangerously-skip-permissions` is now two words.
+  Like every launch option, it applies to a session being created.
+- `IS_SANDBOX=1 claudemux --dangerously-skip-permissions` itself now works. A pane is
+  started by the tmux server with the server's environment, so a variable set
+  for claudemux never reached claude unless the tmux server happened to have
+  been started with it; as root, claude then refused to start. `IS_SANDBOX`,
+  `ANTHROPIC_*`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and
+  `CLAUDE_CODE_NO_FLICKER` are now carried into a new session, and
+  `CLAUDEMUX_ENV=NAME,NAME` adds others.
+- The values travel in a file only you can read, removed as the session starts,
+  not on tmux's command line where every account on the machine could see an
+  API key go by.
+- Reattaching to a running session with extra arguments (`claudemux --resume`)
+  now says that they were not passed on, instead of silently ignoring them.
+
 ## 1.5.0
 
 - Starting a session shows a progress bar, and attaches once Claude has drawn

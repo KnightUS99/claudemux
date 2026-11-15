@@ -123,6 +123,11 @@ pattern rather than shelling out mid-loop.
 - **A detached session is already the right size.** tmux sizes it from the terminal
   that ran `new-session`, so Claude's first frame survives the attach. Do not add
   `-x`/`-y`: tmux 3.2 ignores them here, and `resize-window` pins the size for good.
+- **Forwarded variables are an allowlist, and travel by file.** `FORWARD_ENV` must
+  not become a `CLAUDE_*` prefix: inside a Claude session that prefix carries the
+  session's own id, sockets and tokens. They go through `write_env_file()` (0600,
+  sourced and deleted by the pane command), never `new-session -e`, because argv
+  is world-readable and these can be API keys.
 - **The pane wrapper is deliberate.** `pane_command()` holds a pane open when claude
   exits non-zero or in under `QUICK_EXIT_SECONDS`, so a fast failure stays readable
   instead of the session vanishing.

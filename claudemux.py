@@ -33,7 +33,7 @@ from functools import lru_cache
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
 VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
@@ -59,6 +59,19 @@ TMP_DAYS_ENV = "CLAUDEMUX_TMP_DAYS"    # prune session folders idle this long; 0
 DEFAULT_TMP_DAYS = 14
 PRUNE_UNIT_DEPTH = 3                   # claude-<uid>/<project>/<session>
 TMUX_ENV_FLAG_VERSION = (3, 2)         # new-session -e arrived in tmux 3.2
+
+# Variables carried from the caller into a new session's Claude. A pane is
+# started by the tmux server, with the server's environment, so without this
+# `IS_SANDBOX=1 claudemux ...` reaches claudemux and never reaches claude.
+# Deliberately a short list and not CLAUDE_*: inside a Claude session that
+# prefix is full of per-session plumbing that must not leak into another one.
+FORWARD_ENV = (
+    "IS_SANDBOX", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_NO_FLICKER",
+)
+SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
+FORWARD_ENV_PREFIXES = ("ANTHROPIC_",)
+FORWARD_ENV_SETTING = "CLAUDEMUX_ENV"      # extra names to carry, comma or space separated
 
 # The launch progress line. Claude can take several seconds to draw its first
 # frame, and attaching before then shows an empty pane that looks like a hang;
@@ -762,6 +775,18 @@ def has_flag(args: Sequence[str], *names: str) -> bool:
     return False
 
 
+def with_skip_permissions(extra: Sequence[str], environ: Optional[dict] = None) -> List[str]:
+    """--skip-perms: claude's --dangerously-skip-permissions, and as root the
+    IS_SANDBOX=1 that claude insists on before it will accept that flag."""
+    environ = os.environ if environ is None else environ
+    extra = list(extra)
+    if not has_flag(extra, SKIP_PERMISSIONS_FLAG):
+        extra.insert(0, SKIP_PERMISSIONS_FLAG)
+    if os.getuid() == 0:
+        environ.setdefault("IS_SANDBOX", "1")   # forwarded_environment() carries it in
+    return extra
+
+
 def build_claude_argv(
     claude_bin: str, session: str, extra: Sequence[str], want_rc: bool
 ) -> List[str]:
@@ -778,9 +803,52 @@ def build_claude_argv(
     return [claude_bin] + prefix + list(extra)
 
 
-def pane_command(argv: Sequence[str], env: Optional[dict] = None) -> str:
+def forwarded_environment(environ: Optional[dict] = None) -> dict:
+    """The caller's variables that a new session's Claude should also see."""
+    environ = os.environ if environ is None else environ
+    names = set(FORWARD_ENV)
+    names.update(re.split(r"[,\s]+", environ.get(FORWARD_ENV_SETTING, "")))
+    names.update(key for key in environ if key.startswith(FORWARD_ENV_PREFIXES))
+    return {
+        name: environ[name] for name in sorted(names)
+        if name in environ and re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name)
+    }
+
+
+def write_env_file(session: str, env: dict) -> Optional[str]:
+    """Put env where only this user can read it, for the pane to source once.
+
+    A file rather than `new-session -e`: these can be credentials, and a tmux
+    command line is visible to every account on the machine while it runs.
+    Returns the path, or None if there is nothing to write or nowhere to.
+    """
+    if not env:
+        return None
+    directory = os.path.join(cache_base(), "claudemux", "env")
+    path = os.path.join(directory, "%s.env" % sanitize(session))
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        if os.path.lexists(path):
+            os.unlink(path)                      # never write through a link
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            for key in sorted(env):
+                handle.write("export %s=%s\n" % (key, shlex.quote(env[key])))
+        return path
+    except OSError:
+        return None
+
+
+def pane_command(
+    argv: Sequence[str], env: Optional[dict] = None, env_file: Optional[str] = None
+) -> str:
     """Wrap claude so a fast or failing exit leaves its output on screen."""
     inner = " ".join(shlex.quote(a) for a in argv)
+    if env_file:
+        # Read once and removed, so the values do not outlive the launch on disk.
+        quoted = shlex.quote(env_file)
+        inner = "if [ -r %s ]; then . %s; rm -f %s; fi; %s" % (quoted, quoted, quoted, inner)
     if env:
         # Only for a tmux too old for new-session -e; the variable then reaches
         # claude itself but not a window opened later in the session.
@@ -1006,10 +1074,17 @@ def create_session(
 ) -> None:
     argv = build_claude_argv(find_claude(), session, extra, want_rc)
     flags, env = environment_args({CLAUDE_TMPDIR_ENV: tmpdir} if tmpdir else {})
+    env_file = write_env_file(session, forwarded_environment())
     code, out = tmux_run(
-        None, "new-session", "-d", "-s", session, "-c", cwd, *flags, pane_command(argv, env)
+        None, "new-session", "-d", "-s", session, "-c", cwd, *flags,
+        pane_command(argv, env, env_file),
     )
     if code != 0:
+        if env_file:
+            try:
+                os.unlink(env_file)
+            except OSError:
+                pass
         die("could not create session: %s" % (out or "tmux failed"))
     set_session_option(None, session, "history-limit", str(HISTORY_LIMIT))
     if scroll_setup_enabled():
@@ -1084,6 +1159,13 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
     else:
         progress.update(0.5, "reattaching")
         notes.append("Reattaching to existing session: %s" % session_name)
+        if extra:
+            # Said out loud: otherwise `claudemux --resume` looks like it was obeyed.
+            notes.append(
+                "claudemux: that session is already running, so these were not passed "
+                "to claude: %s\n           (use -n NAME for a separate session, or "
+                "claudemux -k %s first)" % (" ".join(extra), session_name)
+            )
 
     if tmpdir:
         progress.update(0.97, "tidying temporary files")
@@ -1621,9 +1703,15 @@ The mouse wheel and PageUp scroll in every session, with no tmux.conf needed,
 and prefix + m (Ctrl-b m) turns the mouse off and on again for selecting text
 with your terminal. CLAUDEMUX_SCROLL=off leaves tmux's settings untouched.
 
+IS_SANDBOX, ANTHROPIC_* and a few other Claude settings in your environment
+are carried into a new session, so `IS_SANDBOX=1 claudemux ...` works. Name
+anything else in CLAUDEMUX_ENV (e.g. CLAUDEMUX_ENV=HTTPS_PROXY,NO_PROXY).
+
   -n, --name NAME   session name (default: the current directory)
       --detach      create the session but do not attach
       --no-rc       start without Remote Control
+      --skip-perms  start claude with --dangerously-skip-permissions
+                    (as root this also sets IS_SANDBOX=1, which claude requires)
   -l, --list        list sessions            --json   machine-readable
   -a, --attach NAME attach to a session
   -k, --kill NAME   kill a session
@@ -1702,6 +1790,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     name: Optional[str] = None
     detach = False
     want_rc = True
+    skip_perms = False
     all_users = root
     as_json = False
     extra: List[str] = []
@@ -1716,6 +1805,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             detach = True
         elif arg == "--no-rc":
             want_rc = False
+        elif arg in ("--skip-perms", "-skip-perms"):
+            skip_perms = True
         elif arg == "--all":
             all_users = True
         elif arg == "--mine":
@@ -1752,6 +1843,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             extra.append(arg)
 
+    if skip_perms:
+        extra = with_skip_permissions(extra)
     return launch(name, extra, want_rc, detach)
 
 
