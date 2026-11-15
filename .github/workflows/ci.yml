@@ -7,11 +7,17 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.11", "3.13"]
+        include:
+          # ubuntu-latest no longer offers Python 3.9, which is still what
+          # RHEL 9 and its relatives ship; the older image also brings an
+          # older tmux, which is worth having in the matrix anyway.
+          - { python: "3.9", os: ubuntu-24.04 }
+          - { python: "3.11", os: ubuntu-latest }
+          - { python: "3.13", os: ubuntu-latest }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
