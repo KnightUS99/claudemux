@@ -106,8 +106,19 @@ IS_SANDBOX=1 claudemux --dangerously-skip-permissions    # or just: claudemux --
 CLAUDEMUX_ENV=HTTPS_PROXY,NO_PROXY claudemux
 ```
 
-They only apply to a session being created. Reattaching to one that is already running
-changes nothing about it, and claudemux says so if you passed arguments.
+They only apply to a session being created, and so do options for claude itself: one
+that is already running cannot be handed `--dangerously-skip-permissions` or `--model`.
+So when the session you would have reattached was started without the options you gave,
+claudemux leaves it alone and starts another beside it:
+
+```sh
+claudemux                  # claude-<server>-<you>-api, started some time ago
+claudemux --skip-perms     # starts claude-<server>-<you>-api-2 with the flag
+claudemux --skip-perms     # reattaches api-2
+claudemux -n api           # back to the first one
+```
+
+`-c` / `--continue` alone does not do this; it reattaches and says it was not passed on.
 
 ### The browser
 

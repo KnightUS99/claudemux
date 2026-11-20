@@ -128,6 +128,13 @@ pattern rather than shelling out mid-loop.
   session's own id, sockets and tokens. They go through `write_env_file()` (0600,
   sourced and deleted by the pane command), never `new-session -e`, because argv
   is world-readable and these can be API keys.
+- **Options never reach a running claude, so they pick the session.** `launch()`
+  with extra arguments goes through `choose_session()`: a session whose recorded
+  arguments (`@claudemux-args`, a JSON list set by `create_session()`; `/proc` for
+  sessions older than 1.7) lack one of them is skipped for `<base>-2`, `-3`, ...,
+  reattaching the first that has them all. The record is what makes a second
+  `claudemux --skip-perms` reattach rather than spawn a third session; `-c` alone
+  is exempt because it would open the conversation that is live next door.
 - **The pane wrapper is deliberate.** `pane_command()` holds a pane open when claude
   exits non-zero or in under `QUICK_EXIT_SECONDS`, so a fast failure stays readable
   instead of the session vanishing.

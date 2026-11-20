@@ -589,6 +589,107 @@ class TestSkipPerms(unittest.TestCase):
         self.assertEqual(seen, [["--dangerously-skip-permissions", "--resume"]] * 2)
 
 
+class TestOptionsGetTheirOwnSession(unittest.TestCase):
+    """`claudemux --skip-perms` beside a session that was started without it."""
+
+    def setUp(self):
+        self.args = {}          # session name -> the arguments it was started with
+        for name in ("collect_sessions", "session_args", "server_name"):
+            self.addCleanup(setattr, claudemux, name, getattr(claudemux, name))
+        claudemux.server_name = lambda: "box1"
+        claudemux.collect_sessions = lambda **_: [self.session(n) for n in self.args]
+        claudemux.session_args = lambda session: self.args[session.name]
+
+    def session(self, name):
+        return claudemux.Session(
+            name=name, uid=os.getuid(), socket=None, windows=1, attached=0,
+            created=0, activity=0, path="/", command="", pane_pid=0,
+        )
+
+    def name(self, base):
+        return claudemux.full_name(base)
+
+    def choose(self, extra):
+        chosen, reuse = claudemux.choose_session("api", extra, self.session(self.name("api")))
+        return chosen, reuse is not None
+
+    def test_a_session_without_the_option_is_left_alone(self):
+        self.args = {self.name("api"): []}
+        self.assertEqual(self.choose(["--dangerously-skip-permissions"]),
+                         (self.name("api-2"), False))
+
+    def test_a_session_that_has_the_option_is_reattached(self):
+        self.args = {self.name("api"): ["--dangerously-skip-permissions"]}
+        self.assertEqual(self.choose(["--dangerously-skip-permissions"]),
+                         (self.name("api"), True))
+
+    def test_running_it_again_finds_the_sibling_it_made(self):
+        self.args = {self.name("api"): [],
+                     self.name("api-2"): ["--dangerously-skip-permissions"]}
+        self.assertEqual(self.choose(["--dangerously-skip-permissions"]),
+                         (self.name("api-2"), True))
+
+    def test_a_sibling_with_other_options_is_skipped(self):
+        self.args = {self.name("api"): [], self.name("api-2"): ["--model", "opus"]}
+        self.assertEqual(self.choose(["--dangerously-skip-permissions"]),
+                         (self.name("api-3"), False))
+
+    def test_a_later_sibling_wins_over_an_earlier_gap(self):
+        self.args = {self.name("api"): [],
+                     self.name("api-3"): ["--dangerously-skip-permissions"]}
+        self.assertEqual(self.choose(["--dangerously-skip-permissions"]),
+                         (self.name("api-3"), True))
+
+    def test_continue_alone_still_reattaches(self):
+        self.args = {self.name("api"): []}
+        for flag in ("-c", "--continue"):
+            self.assertEqual(self.choose([flag]), (self.name("api"), True))
+        self.assertEqual(self.choose(["-c", "--model", "opus"]), (self.name("api-2"), False))
+
+    def test_missing_args_names_only_what_the_session_lacks(self):
+        self.assertEqual(
+            claudemux.missing_args(["--model", "opus", "-c"], ["--rc", "x", "--model", "opus"]),
+            ["-c"],
+        )
+
+
+class TestSessionArgs(unittest.TestCase):
+    def session(self):
+        return claudemux.Session(
+            name="claude-box1-root-api", uid=os.getuid(), socket=None, windows=1,
+            attached=0, created=0, activity=0, path="/", command="", pane_pid=0,
+        )
+
+    def with_tmux(self, fake):
+        self.addCleanup(setattr, claudemux, "tmux_run", claudemux.tmux_run)
+        claudemux.tmux_run = fake
+        return fake
+
+    def test_reads_what_create_session_recorded(self):
+        self.with_tmux(FakeTmux({("show-options",): (0, '["--model", "opus"]')}))
+        self.assertEqual(claudemux.session_args(self.session()), ["--model", "opus"])
+
+    def test_a_recorded_empty_list_is_not_mistaken_for_no_record(self):
+        self.with_tmux(FakeTmux({("show-options",): (0, "[]")}))
+        self.addCleanup(setattr, claudemux, "proc_argv", claudemux.proc_argv)
+        claudemux.proc_argv = lambda pid: ["claude", "--from-proc"]
+        self.assertEqual(claudemux.session_args(self.session()), [])
+
+    def test_an_older_session_falls_back_to_its_command_line(self):
+        self.with_tmux(FakeTmux({("show-options",): (0, "")}))
+        for name in ("proc_argv", "child_pids"):
+            self.addCleanup(setattr, claudemux, name, getattr(claudemux, name))
+        claudemux.child_pids = lambda pid: [7]
+        claudemux.proc_argv = lambda pid: (
+            ["/root/.local/bin/claude", "--rc", "x", "--dangerously-skip-permissions"]
+            if pid == 7 else ["sh", "-c", "t0=$(date +%s); claude --rc x"]
+        )
+        self.assertEqual(
+            claudemux.session_args(self.session()),
+            ["--rc", "x", "--dangerously-skip-permissions"],
+        )
+
+
 class FakeTmux:
     """Stands in for tmux_run: answers from a table and records every call."""
 

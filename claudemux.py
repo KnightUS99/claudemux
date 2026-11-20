@@ -33,7 +33,7 @@ from functools import lru_cache
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
 VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
@@ -70,6 +70,13 @@ FORWARD_ENV = (
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_NO_FLICKER",
 )
 SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
+# What a session's claude was started with, kept on the session itself so a
+# later `claudemux --some-option` can tell whether that session already has it.
+ARGS_OPTION = "@claudemux-args"
+# Asking to continue while a session is running means "take me back to it",
+# so these alone never start a second session beside the first.
+CONTINUE_FLAGS = ("-c", "--continue")
+MAX_SIBLINGS = 99
 FORWARD_ENV_PREFIXES = ("ANTHROPIC_",)
 FORWARD_ENV_SETTING = "CLAUDEMUX_ENV"      # extra names to carry, comma or space separated
 
@@ -261,6 +268,15 @@ def proc_cmdline(pid: int) -> str:
     except (OSError, ValueError):
         return ""
     return " ".join(part.decode("utf-8", "replace") for part in raw.split(b"\0") if part)
+
+
+def proc_argv(pid: int) -> List[str]:
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            raw = handle.read()
+    except (OSError, ValueError):
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
 
 
 def proc_environ(pid: int) -> dict:
@@ -1087,10 +1103,72 @@ def create_session(
                 pass
         die("could not create session: %s" % (out or "tmux failed"))
     set_session_option(None, session, "history-limit", str(HISTORY_LIMIT))
+    set_session_option(None, session, ARGS_OPTION, json.dumps(list(extra)))
     if scroll_setup_enabled():
         # Before Claude gets as far as probing for it: with mouse off it tells
         # the user to go and edit ~/.tmux.conf.
         set_session_option(None, session, "mouse", "on")
+
+
+def session_args(session: Session) -> List[str]:
+    """The arguments a session's claude was started with.
+
+    Read from the session, where create_session() left them; a session from an
+    older build has no such record, so its claude's command line is used.
+    """
+    code, out = tmux_run(
+        session.socket, "show-options", "-t", "=%s:" % session.name, "-v", ARGS_OPTION
+    )
+    if code == 0 and out.strip():
+        try:
+            value = json.loads(out.strip())
+            if isinstance(value, list):
+                return [str(item) for item in value]
+        except ValueError:
+            pass
+    for pid in [session.pane_pid] + child_pids(session.pane_pid):
+        argv = proc_argv(pid)
+        line = " ".join(argv)
+        if "claude" in line and "date +%s" not in line:    # not the pane's wrapper
+            return argv[1:]
+    return []
+
+
+def missing_args(extra: Sequence[str], running: Sequence[str]) -> List[str]:
+    """The launch options a running session was not started with."""
+    return [arg for arg in extra if arg not in running]
+
+
+def wants_own_session(extra: Sequence[str], running: Sequence[str]) -> bool:
+    """Whether these options call for a session of their own, not a reattach."""
+    return any(arg not in CONTINUE_FLAGS for arg in missing_args(extra, running))
+
+
+def choose_session(
+    base: str, extra: Sequence[str], existing: Session
+) -> Tuple[str, Optional[Session]]:
+    """Where a launch with options goes when `existing` holds the usual name.
+
+    Options cannot be applied to a claude that is already running, so one that
+    was started without them is left alone and the launch moves to <base>-2,
+    <base>-3, ...: the first of those already running with these options is
+    reattached, and failing that the first free name is where a session is
+    created. Returns the name and the session to reattach, or None to create.
+    """
+    if not wants_own_session(extra, session_args(existing)):
+        return existing.name, existing
+    running = {s.name: s for s in collect_sessions(claude_only=False)}
+    free: Optional[str] = None
+    for number in range(2, MAX_SIBLINGS + 1):
+        candidate = full_name("%s-%d" % (base, number))
+        sibling = running.get(candidate)
+        if sibling is None:
+            free = free or candidate
+        elif not wants_own_session(extra, session_args(sibling)):
+            return sibling.name, sibling
+    if free is None:
+        die("too many sessions named %s-N; kill some with: claudemux -k NAME" % full_name(base))
+    return free, None
 
 
 def attach(session: Session) -> "NoReturn":  # type: ignore[valid-type]
@@ -1128,6 +1206,17 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
                 existing, session_name = found, older
                 break
 
+    if existing is not None and extra:
+        # A running claude cannot be given options, so a session started
+        # without these is not the one being asked for.
+        chosen, reuse = choose_session(base, extra, existing)
+        if reuse is None:
+            notes.append(
+                "claudemux: %s is running without %s, so this is a session of its own"
+                % (session_name, " ".join(missing_args(extra, session_args(existing))))
+            )
+        session_name, existing = chosen, reuse
+
     tmpdir = claude_tmpdir()
     if existing is None:
         if tmpdir and not prepare_claude_tmpdir(tmpdir):
@@ -1159,12 +1248,13 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
     else:
         progress.update(0.5, "reattaching")
         notes.append("Reattaching to existing session: %s" % session_name)
-        if extra:
-            # Said out loud: otherwise `claudemux --resume` looks like it was obeyed.
+        ignored = missing_args(extra, session_args(existing))
+        if ignored:
+            # Said out loud: otherwise `claudemux -c` looks like it was obeyed.
             notes.append(
                 "claudemux: that session is already running, so these were not passed "
                 "to claude: %s\n           (use -n NAME for a separate session, or "
-                "claudemux -k %s first)" % (" ".join(extra), session_name)
+                "claudemux -k %s first)" % (" ".join(ignored), session_name)
             )
 
     if tmpdir:
@@ -1722,7 +1812,10 @@ anything else in CLAUDEMUX_ENV (e.g. CLAUDEMUX_ENV=HTTPS_PROXY,NO_PROXY).
                     (claudemux -- --help shows Claude's own help)
 
 Any other argument is passed straight through to claude, so --resume, -c and
---model work directly. Use -- for anything that would otherwise be read as a
+--model work directly. A claude that is already running cannot be given
+options, so if the session was started without them, claudemux starts another
+beside it (NAME-2, NAME-3, ...) and comes back to that one next time. -c alone
+just reattaches. Use -- for anything that would otherwise be read as a
 claudemux flag, e.g. claudemux -- -n "display name".
 
 Examples:

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.7.0
+
+- `claudemux --skip-perms` (or any other option for claude) no longer lands you
+  back in a session that was started without it. Options cannot be given to a
+  claude that is already running, so until now they were dropped with a notice
+  and the only way forward was to kill the session or think of another name.
+  claudemux now starts a session of its own beside the first, named
+  `<name>-2` (then `-3`, ...), and says why.
+- Running the same command again reattaches to that session instead of making
+  a third: each session remembers what its claude was started with, and one
+  that already has the options you asked for is the one you get.
+- `-c` / `--continue` on its own still reattaches to the running session, with
+  the notice as before. Continuing the conversation that is live in another
+  session is not what anyone means by it.
+
 ## 1.6.0
 
 - `claudemux --skip-perms` starts claude with `--dangerously-skip-permissions`.
