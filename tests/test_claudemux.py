@@ -582,7 +582,7 @@ class TestSkipPerms(unittest.TestCase):
         seen = []
         original = claudemux.launch
         self.addCleanup(setattr, claudemux, "launch", original)
-        claudemux.launch = lambda name, extra, want_rc, detach: seen.append(list(extra)) or 0
+        claudemux.launch = lambda name, extra, *rest: seen.append(list(extra)) or 0
         with mock_env(IS_SANDBOX=None):
             for spelling in ("--skip-perms", "-skip-perms"):
                 claudemux.main([spelling, "--resume"])
@@ -645,6 +645,55 @@ class TestOptionsGetTheirOwnSession(unittest.TestCase):
         for flag in ("-c", "--continue"):
             self.assertEqual(self.choose([flag]), (self.name("api"), True))
         self.assertEqual(self.choose(["-c", "--model", "opus"]), (self.name("api-2"), False))
+
+    def test_new_takes_the_first_free_number(self):
+        self.args = {self.name("api"): [], self.name("api-2"): [], self.name("api-4"): []}
+        self.assertEqual(claudemux.free_sibling("api"), self.name("api-3"))
+
+    def test_new_reaches_launch(self):
+        seen = []
+        self.addCleanup(setattr, claudemux, "launch", claudemux.launch)
+        claudemux.launch = lambda name, extra, want_rc, detach, fresh: seen.append(fresh) or 0
+        claudemux.main(["--new", "--model", "opus"])
+        claudemux.main(["--model", "opus"])
+        self.assertEqual(seen, [True, False])
+
+    def test_free_base_keeps_a_name_nobody_has(self):
+        self.args = {self.name("api"): []}
+        self.assertEqual(claudemux.free_base("web"), "web")
+        self.assertEqual(claudemux.free_base("api"), "api-2")
+
+    def routed(self, argv, tty=True, here=True):
+        """Where main() sends a command line: the browser or a straight launch."""
+        seen = []
+        for name in ("launch", "run_browser", "running_here"):
+            self.addCleanup(setattr, claudemux, name, getattr(claudemux, name))
+        claudemux.launch = lambda *a: seen.append(("launch", list(a[1]))) or 0
+        claudemux.run_browser = (
+            lambda all_users, extra=(), want_rc=True, prefer=None:
+            seen.append(("browser", list(extra), prefer)) or 0
+        )
+        claudemux.running_here = lambda name=None: self.session("here") if here else None
+        self.addCleanup(setattr, sys, "stdout", sys.stdout)
+        sys.stdout = EncodedStream()
+        sys.stdout.isatty = lambda: tty
+        claudemux.main(argv)
+        return seen
+
+    def test_options_beside_a_running_session_open_the_browser(self):
+        self.assertEqual(self.routed(["--model", "opus"]),
+                         [("browser", ["--model", "opus"], "here")])
+
+    def test_nothing_running_here_just_starts(self):
+        self.assertEqual(self.routed(["--model", "opus"], here=False),
+                         [("launch", ["--model", "opus"])])
+
+    def test_a_name_new_detach_or_no_terminal_skip_the_browser(self):
+        for argv in (["-n", "api", "--model", "opus"], ["--new", "--model", "opus"],
+                     ["--detach", "--model", "opus"]):
+            self.assertEqual(self.routed(argv), [("launch", ["--model", "opus"])])
+        self.assertEqual(self.routed(["--model", "opus"], tty=False),
+                         [("launch", ["--model", "opus"])])
 
     def test_missing_args_names_only_what_the_session_lacks(self):
         self.assertEqual(

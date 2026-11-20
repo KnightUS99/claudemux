@@ -108,17 +108,16 @@ CLAUDEMUX_ENV=HTTPS_PROXY,NO_PROXY claudemux
 
 They only apply to a session being created, and so do options for claude itself: one
 that is already running cannot be handed `--dangerously-skip-permissions` or `--model`.
-So when the session you would have reattached was started without the options you gave,
-claudemux leaves it alone and starts another beside it:
+So when you give options in a directory that already has a session, claudemux opens the
+browser with the cursor on that session rather than guessing: ENTER switches to it, and
+`n` starts a new one, with your options, under the next free name.
 
 ```sh
-claudemux                  # claude-<server>-<you>-api, started some time ago
-claudemux --skip-perms     # starts claude-<server>-<you>-api-2 with the flag
-claudemux --skip-perms     # reattaches api-2
-claudemux -n api           # back to the first one
+claudemux --skip-perms          # a session is running here: browser, ENTER or n
+claudemux --new --skip-perms    # no question: start claude-<server>-<you>-api-2
+claudemux -n api --skip-perms   # no browser either; if api was started without the
+                                # flag it is left alone and api-2 is used
 ```
-
-`-c` / `--continue` alone does not do this; it reattaches and says it was not passed on.
 
 ### The browser
 

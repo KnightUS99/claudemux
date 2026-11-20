@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.8.0
+
+- `claudemux --skip-perms` (or any other option for claude) in a directory that
+  already has a session now opens the browser, with the cursor on that session:
+  ENTER switches to it, `n` starts a new one with the options you gave. 1.7.0
+  decided for you, and decided wrong whenever the running session already had
+  the option - it reattached and there was no way to ask for a second one.
+- `n` in the browser always starts a new session. It offers a name nobody is
+  using (`api-2` when `api` is running), and a name that is taken gets the next
+  free number instead of quietly reattaching.
+- `--new` starts another session beside the one running here without asking:
+  `claudemux --new --skip-perms`.
+- With `-n NAME`, `--detach` or no terminal there is no browser, and 1.7.0's
+  rule still applies: a session started without the options is left alone and
+  `NAME-2` is used.
+
 ## 1.7.0
 
 - `claudemux --skip-perms` (or any other option for claude) no longer lands you

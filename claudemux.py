@@ -33,7 +33,7 @@ from functools import lru_cache
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 REPO = os.environ.get("CLAUDEMUX_REPO", "KnightUS99/claudemux")
 VERSION_URL = "https://raw.githubusercontent.com/%s/main/VERSION" % REPO
@@ -1171,6 +1171,32 @@ def choose_session(
     return free, None
 
 
+def free_base(base: str) -> str:
+    """`base` if no session has that name, else the first free <base>-2, -3, ..."""
+    running = {s.name for s in collect_sessions(claude_only=False)}
+    if not running.intersection([full_name(base)] + legacy_names(base)):
+        return base
+    for number in range(2, MAX_SIBLINGS + 1):
+        candidate = "%s-%d" % (base, number)
+        if full_name(candidate) not in running:
+            return candidate
+    die("too many sessions named %s-N; kill some with: claudemux -k NAME" % full_name(base))
+
+
+def free_sibling(base: str) -> str:
+    return full_name(free_base(base))
+
+
+def running_here(name: Optional[str] = None) -> Optional[Session]:
+    """The session a plain launch from this directory would reattach."""
+    base = name or os.path.basename(os.getcwd()) or "root"
+    for candidate in [full_name(base)] + legacy_names(base):
+        session = find_session(candidate)
+        if session is not None:
+            return session
+    return None
+
+
 def attach(session: Session) -> "NoReturn":  # type: ignore[valid-type]
     """Hand the terminal over to tmux; this replaces the current process."""
     prepare_scrolling(session)
@@ -1189,7 +1215,10 @@ def attach(session: Session) -> "NoReturn":  # type: ignore[valid-type]
     os.execvp("tmux", tmux_argv(session.socket, "attach-session", "-t", "=" + session.name))
 
 
-def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: bool) -> int:
+def launch(
+    name: Optional[str], extra: Sequence[str], want_rc: bool, detach: bool,
+    fresh: bool = False,
+) -> int:
     cwd = os.getcwd()
     base = name or os.path.basename(cwd) or "root"
     session_name = full_name(base)
@@ -1206,7 +1235,10 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
                 existing, session_name = found, older
                 break
 
-    if existing is not None and extra:
+    if existing is not None and fresh:
+        # --new: asked for outright, so whatever is running stays where it is.
+        session_name, existing = free_sibling(base), None
+    elif existing is not None and extra:
         # A running claude cannot be given options, so a session started
         # without these is not the one being asked for.
         chosen, reuse = choose_session(base, extra, existing)
@@ -1255,6 +1287,12 @@ def launch(name: Optional[str], extra: Sequence[str], want_rc: bool, detach: boo
                 "claudemux: that session is already running, so these were not passed "
                 "to claude: %s\n           (use -n NAME for a separate session, or "
                 "claudemux -k %s first)" % (" ".join(ignored), session_name)
+            )
+        elif extra:
+            # Otherwise a reattach looks like the request for a session was ignored.
+            notes.append(
+                "claudemux: it is already running with %s  (claudemux --new starts another)"
+                % " ".join(extra)
             )
 
     if tmpdir:
@@ -1438,9 +1476,14 @@ class Browser:
 
     REFRESH_SECONDS = 2.0
 
-    def __init__(self, screen: "curses._CursesWindow", all_users: bool) -> None:
+    def __init__(
+        self, screen: "curses._CursesWindow", all_users: bool,
+        extra: Sequence[str] = (), prefer: Optional[str] = None,
+    ) -> None:
         self.screen = screen
         self.all_users = all_users
+        self.extra = list(extra)        # what a session started with n is given
+        self.prefer = prefer            # the session to start the cursor on
         self.sessions: List[Session] = []
         self.index = 0
         self.filter = ""
@@ -1456,6 +1499,11 @@ class Browser:
     def load(self) -> None:
         self.sessions = collect_sessions(all_users=self.all_users)
         self.last_load = time.time()
+        if self.prefer:
+            names = [s.name for s in self.visible]
+            if self.prefer in names:
+                self.index = names.index(self.prefer)
+            self.prefer = None
         if self.index >= len(self.visible):
             self.index = max(0, len(self.visible) - 1)
 
@@ -1577,8 +1625,13 @@ class Browser:
         footer = "  ENTER attach  n new  x kill  r rename  d details  / filter  ? help  q quit"
         if self.filter:
             footer = "  filter: %s   (ESC clears)  |%s" % (self.filter, footer)
-        self.write(height - 2, 0, self.message.ljust(width),
-                   self.theme.message if self.message else curses.A_NORMAL)
+        message = self.message
+        if not message and self.extra:
+            # Standing, not a one-key message: it is why this screen opened.
+            message = "  ENTER switches to a session; n starts a new one with %s" % (
+                " ".join(self.extra))
+        self.write(height - 2, 0, message.ljust(width),
+                   self.theme.message if message else curses.A_NORMAL)
         self.write(height - 1, 0, footer.ljust(width), self.theme.footer)
 
         if self.show_help:
@@ -1666,7 +1719,8 @@ class Browser:
         self.load()
 
     def do_new(self) -> None:
-        default = os.path.basename(os.getcwd()) or "root"
+        # A name nobody is using, so Enter alone always gives a new session.
+        default = free_base(os.path.basename(os.getcwd()) or "root")
         name = self.ask("new session name: ", default)
         if name is None:
             self.message = "cancelled"
@@ -1749,18 +1803,22 @@ class Browser:
                 self.index = 0
 
 
-def run_browser(all_users: bool) -> int:
+def run_browser(
+    all_users: bool, extra: Sequence[str] = (), want_rc: bool = True,
+    prefer: Optional[str] = None,
+) -> int:
     require_tmux()
     if not sys.stdout.isatty():
         die("no terminal available - use --list instead")
-    action = curses.wrapper(lambda screen: Browser(screen, all_users).run())
+    action = curses.wrapper(lambda screen: Browser(screen, all_users, extra, prefer).run())
     if action is None:
         return 0
     kind, payload = action
     if kind == "attach":
         attach(payload)  # type: ignore[arg-type]
     if kind == "new":
-        return launch(str(payload), [], want_rc=True, detach=False)
+        # fresh: "new" typed over a name that is taken still means new.
+        return launch(str(payload), list(extra), want_rc=want_rc, detach=False, fresh=True)
     if kind == "update":
         return cmd_update()
     return 0
@@ -1798,6 +1856,8 @@ are carried into a new session, so `IS_SANDBOX=1 claudemux ...` works. Name
 anything else in CLAUDEMUX_ENV (e.g. CLAUDEMUX_ENV=HTTPS_PROXY,NO_PROXY).
 
   -n, --name NAME   session name (default: the current directory)
+      --new         start another session even if one is already running here
+                    (named NAME-2, NAME-3, ...)
       --detach      create the session but do not attach
       --no-rc       start without Remote Control
       --skip-perms  start claude with --dangerously-skip-permissions
@@ -1813,14 +1873,15 @@ anything else in CLAUDEMUX_ENV (e.g. CLAUDEMUX_ENV=HTTPS_PROXY,NO_PROXY).
 
 Any other argument is passed straight through to claude, so --resume, -c and
 --model work directly. A claude that is already running cannot be given
-options, so if the session was started without them, claudemux starts another
-beside it (NAME-2, NAME-3, ...) and comes back to that one next time. -c alone
-just reattaches. Use -- for anything that would otherwise be read as a
+options, so if a session is already running for this directory, claudemux
+opens the browser instead: ENTER switches to a session, n starts a new one
+with the options you gave. --new skips the question and starts one. Use -- for anything that would otherwise be read as a
 claudemux flag, e.g. claudemux -- -n "display name".
 
 Examples:
   claudemux                     browse and attach
   claudemux -n review           start/reattach "claude-<server>-<user>-review"
+  claudemux --new --skip-perms  a second session beside the one running here
   claudemux --resume            pick a past conversation to resume
   claudemux -l --all            every user's sessions (as root)
 """
@@ -1884,6 +1945,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     detach = False
     want_rc = True
     skip_perms = False
+    fresh = False
     all_users = root
     as_json = False
     extra: List[str] = []
@@ -1896,6 +1958,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             name = args.pop(0)
         elif arg == "--detach":
             detach = True
+        elif arg == "--new":
+            fresh = True
         elif arg == "--no-rc":
             want_rc = False
         elif arg in ("--skip-perms", "-skip-perms"):
@@ -1938,7 +2002,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if skip_perms:
         extra = with_skip_permissions(extra)
-    return launch(name, extra, want_rc, detach)
+    if extra and name is None and not fresh and not detach and sys.stdout.isatty():
+        # Options for claude, and a session already running here: they cannot
+        # be applied to it, and whether to go back to it or start another is
+        # the caller's to choose.
+        here = running_here()
+        if here is not None:
+            return run_browser(all_users, extra, want_rc, prefer=here.name)
+    return launch(name, extra, want_rc, detach, fresh)
 
 
 if __name__ == "__main__":
